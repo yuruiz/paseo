@@ -78,6 +78,7 @@ export type {
 
 const HISTORY_STALE_AFTER_MS = 60_000;
 const AUTHORITATIVE_REVALIDATION_DEBOUNCE_MS = 300;
+const APP_RESUMED_COALESCE_WINDOW_MS = 250;
 
 function hasAgentUsageChanged(
   incomingUsage: Agent["lastUsage"] | undefined,
@@ -498,6 +499,8 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
   const revalidationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const revalidationInFlightRef = useRef<Promise<void> | null>(null);
   const revalidationQueuedRef = useRef(false);
+  const appResumedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const appResumedPendingAwayMsRef = useRef<number>(0);
   const wasConnectedRef = useRef(isConnected);
   const audioOutputBuffersRef = useRef<Map<string, BufferedAudioChunk[]>>(new Map());
   const activeAudioGroupsRef = useRef<Set<string>>(new Set());
@@ -744,7 +747,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     }, AUTHORITATIVE_REVALIDATION_DEBOUNCE_MS);
   }, [client, flushAuthoritativeRevalidation, isConnected]);
 
-  const handleAppResumed = useCallback(
+  const runAppResumedEffects = useCallback(
     (awayMs: number) => {
       scheduleAuthoritativeRevalidation();
 
@@ -770,6 +773,24 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       bumpHistorySyncGeneration(serverId);
     },
     [bumpHistorySyncGeneration, client, scheduleAuthoritativeRevalidation, serverId],
+  );
+
+  // Coalesce burst of resume signals: AppState change + visibilitychange + WS
+  // online transition can fire within milliseconds of each other on macOS unlock.
+  const handleAppResumed = useCallback(
+    (awayMs: number) => {
+      appResumedPendingAwayMsRef.current = Math.max(appResumedPendingAwayMsRef.current, awayMs);
+      if (appResumedTimerRef.current) {
+        return;
+      }
+      appResumedTimerRef.current = setTimeout(() => {
+        appResumedTimerRef.current = null;
+        const coalescedAwayMs = appResumedPendingAwayMsRef.current;
+        appResumedPendingAwayMsRef.current = 0;
+        runAppResumedEffects(coalescedAwayMs);
+      }, APP_RESUMED_COALESCE_WINDOW_MS);
+    },
+    [runAppResumedEffects],
   );
 
   // Client activity tracking (heartbeat, push token registration)
@@ -1158,6 +1179,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     return () => {
       if (revalidationTimerRef.current) {
         clearTimeout(revalidationTimerRef.current);
+      }
+      if (appResumedTimerRef.current) {
+        clearTimeout(appResumedTimerRef.current);
       }
     };
   }, []);

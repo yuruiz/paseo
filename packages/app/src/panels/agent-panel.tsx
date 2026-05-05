@@ -846,6 +846,13 @@ function ChatAgentContent({
     if (!isConnected || !hasSession) {
       return;
     }
+    // Defer the bump-driven catch-up to user-visible panels so a single
+    // resume event doesn't fan out to every mounted panel at once.
+    // Background panels pick up the catch-up via the focus effect when
+    // they later become user-visible.
+    if (!isPaneFocused) {
+      return;
+    }
     const shouldSyncOnEntry = needsAuthoritativeSync || isNative;
     if (!shouldSyncOnEntry) {
       return;
@@ -857,6 +864,7 @@ function ChatAgentContent({
     ensureInitializedWithSyncErrorHandling,
     hasSession,
     isConnected,
+    isPaneFocused,
     needsAuthoritativeSync,
   ]);
 

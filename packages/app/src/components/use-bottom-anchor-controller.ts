@@ -110,19 +110,53 @@ const MAX_VERIFICATION_RETRIES = 3;
 const WEB_PARTIAL_VIRTUALIZED_CONFIRMATION_DELAY_FRAMES = 1;
 const USER_SCROLL_AWAY_DELTA_PX = 24;
 
+// Active rAF handles are tracked so that when the document is hidden (e.g. macOS
+// display sleep) we can cancel every pending recursive chain. Otherwise Chromium
+// throttles rAF while occluded and the chains pile up, draining the JS thread on
+// resume.
+const activeRafHandles = new Set<ScheduledFrameHandle>();
+let visibilityListenerAttached = false;
+
+function ensureRafVisibilityListener(): void {
+  if (visibilityListenerAttached) {
+    return;
+  }
+  if (typeof document === "undefined") {
+    return;
+  }
+  visibilityListenerAttached = true;
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "hidden") {
+      return;
+    }
+    for (const handle of activeRafHandles) {
+      handle.cancelled = true;
+      if (handle.rafId !== null) {
+        cancelAnimationFrame(handle.rafId);
+        handle.rafId = null;
+      }
+    }
+    activeRafHandles.clear();
+  });
+}
+
 function scheduleAnimationFrameWithDelay(input: {
   callback: () => void;
   delayFrames?: number;
 }): ScheduledFrameHandle {
+  ensureRafVisibilityListener();
+
   const handle: ScheduledFrameHandle = {
     cancelled: false,
     rafId: null,
     remainingFrames: Math.max(0, input.delayFrames ?? 0),
     callback: input.callback,
   };
+  activeRafHandles.add(handle);
 
   const tick = () => {
     if (handle.cancelled) {
+      activeRafHandles.delete(handle);
       return;
     }
     if (handle.remainingFrames > 0) {
@@ -131,6 +165,7 @@ function scheduleAnimationFrameWithDelay(input: {
       return;
     }
     handle.rafId = null;
+    activeRafHandles.delete(handle);
     input.callback();
   };
 
@@ -148,6 +183,7 @@ function cancelScheduledAnimationFrame(handle: unknown): void {
     cancelAnimationFrame(scheduled.rafId);
     scheduled.rafId = null;
   }
+  activeRafHandles.delete(scheduled);
 }
 
 function deriveVerificationBlockedReason(input: {

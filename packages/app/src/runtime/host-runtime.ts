@@ -1196,6 +1196,10 @@ function rekeyMap<V>(map: Map<string, V>, oldKey: string, newKey: string): void 
   map.set(newKey, value);
 }
 
+// Mirrors HISTORY_STALE_AFTER_MS in session-context. Reconnects faster than this
+// threshold do not invalidate per-panel timeline caches.
+const HISTORY_STALE_AFTER_MS = 60_000;
+
 export class HostRuntimeStore {
   private controllers = new Map<string, HostRuntimeController>();
   private serverListeners = new Map<string, Set<() => void>>();
@@ -1206,6 +1210,7 @@ export class HostRuntimeStore {
   private hosts: HostProfile[] = [];
   private deps: HostRuntimeControllerDeps;
   private lastConnectionStatusByServer = new Map<string, HostRuntimeConnectionStatus>();
+  private offlineSinceByServer = new Map<string, number>();
   private agentDirectoryBootstrapInFlight = new Map<string, Promise<void>>();
   private bootStarted = false;
 
@@ -1365,6 +1370,7 @@ export class HostRuntimeStore {
     controller.adoptReconciledServerId(newServerId);
 
     rekeyMap(this.lastConnectionStatusByServer, oldServerId, newServerId);
+    rekeyMap(this.offlineSinceByServer, oldServerId, newServerId);
     rekeyMap(this.agentDirectoryBootstrapInFlight, oldServerId, newServerId);
 
     const listeners = this.serverListeners.get(oldServerId);
@@ -1597,6 +1603,7 @@ export class HostRuntimeStore {
       }
       this.controllers.delete(serverId);
       this.lastConnectionStatusByServer.delete(serverId);
+      this.offlineSinceByServer.delete(serverId);
       this.agentDirectoryBootstrapInFlight.delete(serverId);
       void controller.stop();
       this.emit(serverId);
@@ -1648,6 +1655,7 @@ export class HostRuntimeStore {
     const controller = this.controllers.get(serverId);
     if (!controller) {
       this.lastConnectionStatusByServer.delete(serverId);
+      this.offlineSinceByServer.delete(serverId);
       this.agentDirectoryBootstrapInFlight.delete(serverId);
       return;
     }
@@ -1656,8 +1664,21 @@ export class HostRuntimeStore {
     this.lastConnectionStatusByServer.set(serverId, snapshot.connectionStatus);
     const didTransitionOnline =
       snapshot.connectionStatus === "online" && previousStatus !== "online";
+    const wasPreviouslyOnline = previousStatus === "online";
+    if (snapshot.connectionStatus !== "online" && wasPreviouslyOnline) {
+      this.offlineSinceByServer.set(serverId, Date.now());
+    }
     if (didTransitionOnline) {
-      useSessionStore.getState().bumpHistorySyncGeneration(serverId);
+      const offlineSince = this.offlineSinceByServer.get(serverId);
+      this.offlineSinceByServer.delete(serverId);
+      // Skip the bump on quick blips — only invalidate panel timeline caches
+      // when the offline window crossed the staleness threshold. The first
+      // online transition (no prior offline timestamp) still bumps so a fresh
+      // boot syncs once.
+      const offlineDurationMs = offlineSince === undefined ? Infinity : Date.now() - offlineSince;
+      if (offlineDurationMs >= HISTORY_STALE_AFTER_MS) {
+        useSessionStore.getState().bumpHistorySyncGeneration(serverId);
+      }
     }
 
     // Runtime owns directory bootstrap policy, including reconnect and delayed
