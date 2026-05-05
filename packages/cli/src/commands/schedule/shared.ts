@@ -107,7 +107,7 @@ function resolveScheduleTarget(args: {
   if (hasExplicitNewAgentOption) {
     throw {
       code: "INVALID_TARGET",
-      message: "--provider/--mode/--thinking can only be used with a new-agent target",
+      message: "--provider/--mode/--effort can only be used with a new-agent target",
       details: "Use --target new-agent or omit --target to create a new agent schedule",
     } satisfies CommandError;
   }
@@ -133,7 +133,7 @@ export function parseScheduleCreateInput(options: {
   target?: string;
   provider?: string;
   mode?: string;
-  thinking?: string;
+  effort?: string;
   cwd?: string;
   host?: string;
   maxRuns?: string;
@@ -169,9 +169,9 @@ export function parseScheduleCreateInput(options: {
 
   const targetValue = options.target?.trim();
   const modeId = options.mode?.trim();
-  const thinkingOptionId = options.thinking?.trim();
+  const thinkingOptionId = options.effort?.trim();
   const hasExplicitNewAgentOption =
-    options.provider !== undefined || options.mode !== undefined || options.thinking !== undefined;
+    options.provider !== undefined || options.mode !== undefined || options.effort !== undefined;
   const createNewAgentTarget = (): ScheduleTarget => {
     const resolvedProviderModel = resolveProviderAndModel({
       provider: options.provider,
@@ -241,7 +241,7 @@ export interface ScheduleUpdateOptionsInput {
   provider?: string;
   model?: string;
   mode?: string;
-  thinking?: string;
+  effort?: string;
   cwd?: string;
   maxRuns?: string;
   expiresIn?: string;
@@ -381,8 +381,8 @@ function buildNewAgentConfigPatch(
     const trimmed = options.mode.trim();
     patch.modeId = trimmed.length > 0 ? trimmed : null;
   }
-  if (options.thinking !== undefined) {
-    const trimmed = options.thinking.trim();
+  if (options.effort !== undefined) {
+    const trimmed = options.effort.trim();
     patch.thinkingOptionId = trimmed.length > 0 ? trimmed : null;
   }
   if (options.cwd !== undefined) {

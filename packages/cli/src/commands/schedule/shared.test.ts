@@ -116,11 +116,11 @@ describe("parseScheduleCreateInput agent config flags", () => {
     vi.restoreAllMocks();
   });
 
-  test("--mode and --thinking are written to new-agent config", () => {
+  test("--mode and --effort are written to new-agent config", () => {
     const input = parseScheduleCreateInput({
       ...baseOptions,
       mode: "bypassPermissions",
-      thinking: "max",
+      effort: "max",
     });
     expect(input.target).toEqual({
       type: "new-agent",
@@ -133,12 +133,12 @@ describe("parseScheduleCreateInput agent config flags", () => {
     });
   });
 
-  test("--provider model shorthand carries through with --thinking", () => {
+  test("--provider model shorthand carries through with --effort", () => {
     const input = parseScheduleCreateInput({
       ...baseOptions,
       provider: "claude/claude-opus-4-7[1m]",
       mode: "bypassPermissions",
-      thinking: "max",
+      effort: "max",
     });
     expect(input.target).toEqual({
       type: "new-agent",
@@ -152,17 +152,17 @@ describe("parseScheduleCreateInput agent config flags", () => {
     });
   });
 
-  test("--thinking on a non-new-agent target is rejected", () => {
+  test("--effort on a non-new-agent target is rejected", () => {
     expect(() =>
       parseScheduleCreateInput({
         ...baseOptions,
         target: "11111111-1111-1111-1111-111111111111",
-        thinking: "max",
+        effort: "max",
       }),
     ).toThrow(
       expect.objectContaining({
         code: "INVALID_TARGET",
-        message: expect.stringContaining("--thinking"),
+        message: expect.stringContaining("--effort"),
       }),
     );
   });
@@ -244,12 +244,12 @@ describe("parseScheduleUpdateInput", () => {
     });
   });
 
-  test("--thinking sets thinkingOptionId; empty value clears it", () => {
-    expect(parseScheduleUpdateInput({ id: "abc", thinking: "max" })).toEqual({
+  test("--effort sets thinkingOptionId; empty value clears it", () => {
+    expect(parseScheduleUpdateInput({ id: "abc", effort: "max" })).toEqual({
       id: "abc",
       newAgentConfig: { thinkingOptionId: "max" },
     });
-    expect(parseScheduleUpdateInput({ id: "abc", thinking: "" })).toEqual({
+    expect(parseScheduleUpdateInput({ id: "abc", effort: "" })).toEqual({
       id: "abc",
       newAgentConfig: { thinkingOptionId: null },
     });
