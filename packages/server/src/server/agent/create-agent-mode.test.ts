@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { resolveAndValidateCreateAgentMode } from "./create-agent-mode.js";
 
-const CLAUDE_MODES = ["default", "acceptEdits", "plan", "bypassPermissions"];
+const CLAUDE_MODES = ["default", "acceptEdits", "auto", "plan", "bypassPermissions"];
 const OPENCODE_MODES = ["build", "full-access", "plan"];
 const CODEX_MODES = ["auto", "full-access"];
 

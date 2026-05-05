@@ -958,7 +958,7 @@ test("plan approval exposes a resume-bypass action and can return to bypassPermi
 test("reuses one autonomous run for unbound stream_event bursts with no foreground run", async () => {
   const session = await createSession();
   const internal: {
-    turnState: "idle" | "foreground" | "autonomous";
+    turnState: "idle" | "foreground" | "background";
     nextTurnOrdinal: number;
     routeSdkMessageFromPump: (message: Record<string, unknown>) => void;
     autonomousTurn: { id: string } | null;

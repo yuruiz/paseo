@@ -46,6 +46,14 @@ const CLAUDE_MODES: AgentProviderModeDefinition[] = [
     colorTier: "moderate",
   },
   {
+    id: "auto",
+    label: "Auto Mode",
+    description:
+      "Classifier-driven approvals. Falls back to prompting after repeated denials. Requires Max/Team/Enterprise plan.",
+    icon: "ShieldAlert",
+    colorTier: "moderate",
+  },
+  {
     id: "plan",
     label: "Plan Mode",
     description: "Analyze the codebase without executing tools or edits",

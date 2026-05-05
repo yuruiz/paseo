@@ -169,7 +169,10 @@ function isImageMimeType(
   );
 }
 
-type TurnState = "idle" | "foreground" | "autonomous";
+// Paseo's internal turn-state discriminator. Distinct from Anthropic's "auto"
+// permission mode: "background" here means a non-user-initiated turn (wake-up,
+// scheduled run, push-triggered), not a permission tier.
+type TurnState = "idle" | "foreground" | "background";
 
 interface EventIdentifiers {
   taskId: string | null;
@@ -206,6 +209,12 @@ const DEFAULT_MODES: AgentMode[] = [
     id: "acceptEdits",
     label: "Accept File Edits",
     description: "Automatically approves edit-focused tools without prompting",
+  },
+  {
+    id: "auto",
+    label: "Auto Mode",
+    description:
+      "Classifier-driven approvals. Falls back to prompting after repeated denials. Requires Max/Team/Enterprise plan.",
   },
   {
     id: "plan",
@@ -732,6 +741,22 @@ function isMcpServersRecord(value: unknown): value is Record<string, McpServerCo
 
 function isPermissionMode(value: string | undefined): value is PermissionMode {
   return typeof value === "string" && VALID_CLAUDE_MODES.has(value);
+}
+
+// Auto mode requires direct Anthropic API; Bedrock and Vertex are unsupported.
+// Returns the ineligible transport label if the env routes Claude Code through
+// one of those, else null. Per-agent launchEnv overrides process.env so an
+// explicit "0" disables the inherited setting.
+function detectIneligibleAutoModeTransport(
+  launchEnv: Record<string, string> | undefined,
+): "AWS Bedrock" | "GCP Vertex AI" | null {
+  const isTruthy = (v: string | undefined): boolean =>
+    v !== undefined && v !== "" && v !== "0" && v.toLowerCase() !== "false";
+  const resolve = (key: string): string | undefined =>
+    launchEnv && key in launchEnv ? launchEnv[key] : process.env[key];
+  if (isTruthy(resolve("CLAUDE_CODE_USE_BEDROCK"))) return "AWS Bedrock";
+  if (isTruthy(resolve("CLAUDE_CODE_USE_VERTEX"))) return "GCP Vertex AI";
+  return null;
 }
 
 function coerceSessionMetadata(metadata: AgentMetadata | undefined): Partial<AgentSessionConfig> {
@@ -1784,6 +1809,15 @@ class ClaudeAgentSession implements AgentSession {
       );
     }
 
+    if (modeId === "auto") {
+      const ineligible = detectIneligibleAutoModeTransport(this.launchEnv);
+      if (ineligible) {
+        throw new Error(
+          `Auto mode is not supported on ${ineligible}. Use the Anthropic API endpoint, or pick a different mode.`,
+        );
+      }
+    }
+
     const normalized = isPermissionMode(modeId) ? modeId : "default";
     const previousMode = this.currentMode;
     const activeQuery = await this.ensureQuery();
@@ -2243,11 +2277,6 @@ class ClaudeAgentSession implements AgentSession {
         ? this.config.thinkingOptionId
         : undefined;
     if (thinkingOptionId && isClaudeThinkingEffort(thinkingOptionId)) {
-      if (thinkingOptionId === "xhigh") {
-        // "xhigh" is accepted by Claude Opus 4.7 but not yet in the SDK type definitions
-        // @ts-expect-error -- SDK 0.2.71 effort type doesn't include "xhigh" yet
-        return { thinking: { type: "adaptive" }, effort: thinkingOptionId };
-      }
       return { thinking: { type: "adaptive" }, effort: thinkingOptionId };
     }
     return { thinking: undefined, effort: undefined };
@@ -2421,7 +2450,7 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     if (this.autonomousTurn) {
-      this.transitionTurnState("autonomous", reason);
+      this.transitionTurnState("background", reason);
       return;
     }
     this.transitionTurnState("idle", reason);
@@ -2486,7 +2515,7 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
-  private createTurnId(owner: "foreground" | "autonomous"): string {
+  private createTurnId(owner: "foreground" | "background"): string {
     return `${owner}-turn-${this.nextTurnOrdinal++}`;
   }
 
@@ -2599,7 +2628,7 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     this.autonomousTurn = {
-      id: this.createTurnId("autonomous"),
+      id: this.createTurnId("background"),
     };
     this.notifySubscribers({ type: "turn_started", provider: "claude" });
     this.syncTurnState("autonomous turn started");
