@@ -15,6 +15,19 @@ export function focusWithRetries({
 }: FocusWithRetriesOptions): () => void {
   let cancelled = false;
   const deadlineMs = Date.now() + timeoutMs;
+  const doc = typeof document === "undefined" ? null : document;
+
+  const handleVisibilityChange = () => {
+    if (doc?.visibilityState === "hidden") {
+      cancelled = true;
+    }
+  };
+  doc?.addEventListener("visibilitychange", handleVisibilityChange);
+
+  const cancel = () => {
+    cancelled = true;
+    doc?.removeEventListener("visibilitychange", handleVisibilityChange);
+  };
 
   const tick = () => {
     if (cancelled) return;
@@ -27,11 +40,13 @@ export function focusWithRetries({
 
     if (isFocused()) {
       onSuccess?.();
+      cancel();
       return;
     }
 
     if (Date.now() >= deadlineMs) {
       onTimeout?.();
+      cancel();
       return;
     }
 
@@ -42,7 +57,5 @@ export function focusWithRetries({
 
   tick();
 
-  return () => {
-    cancelled = true;
-  };
+  return cancel;
 }
