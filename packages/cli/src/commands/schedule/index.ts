@@ -31,6 +31,10 @@ export function createScheduleCommand(): Command {
         "--mode <mode>",
         "Provider-specific mode (e.g. claude bypassPermissions, opencode build)",
       )
+      .option(
+        "--thinking <id>",
+        "Provider-specific thinking effort (e.g. claude low|medium|high|xhigh|max)",
+      )
       .option("--cwd <path>", "Working directory (default: current; required with --host)")
       .option("--run-now", "Fire one immediate run on creation (only with --cron)")
       .option("--no-run-now", "Wait the full interval before the first run (only with --every)")
@@ -90,6 +94,10 @@ export function createScheduleCommand(): Command {
       )
       .option("--model <model>", "New agent model (only for new-agent target)")
       .option("--mode <mode>", "New agent provider mode (only for new-agent target)")
+      .option(
+        "--thinking <id>",
+        "New agent thinking effort, e.g. claude low|medium|high|xhigh|max (only for new-agent target)",
+      )
       .option("--cwd <path>", "New working directory (only for new-agent target)")
       .option("--max-runs <n>", "Set or change maximum number of runs")
       .option("--no-max-runs", "Clear the max-runs limit")

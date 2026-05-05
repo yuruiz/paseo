@@ -107,7 +107,7 @@ function resolveScheduleTarget(args: {
   if (hasExplicitNewAgentOption) {
     throw {
       code: "INVALID_TARGET",
-      message: "--provider/--mode can only be used with a new-agent target",
+      message: "--provider/--mode/--thinking can only be used with a new-agent target",
       details: "Use --target new-agent or omit --target to create a new agent schedule",
     } satisfies CommandError;
   }
@@ -133,6 +133,7 @@ export function parseScheduleCreateInput(options: {
   target?: string;
   provider?: string;
   mode?: string;
+  thinking?: string;
   cwd?: string;
   host?: string;
   maxRuns?: string;
@@ -168,7 +169,9 @@ export function parseScheduleCreateInput(options: {
 
   const targetValue = options.target?.trim();
   const modeId = options.mode?.trim();
-  const hasExplicitNewAgentOption = options.provider !== undefined || options.mode !== undefined;
+  const thinkingOptionId = options.thinking?.trim();
+  const hasExplicitNewAgentOption =
+    options.provider !== undefined || options.mode !== undefined || options.thinking !== undefined;
   const createNewAgentTarget = (): ScheduleTarget => {
     const resolvedProviderModel = resolveProviderAndModel({
       provider: options.provider,
@@ -180,6 +183,7 @@ export function parseScheduleCreateInput(options: {
         cwd: cwdInput ?? process.cwd(),
         ...(resolvedProviderModel.model ? { model: resolvedProviderModel.model } : {}),
         ...(modeId ? { modeId } : {}),
+        ...(thinkingOptionId ? { thinkingOptionId } : {}),
       },
     };
   };
@@ -237,6 +241,7 @@ export interface ScheduleUpdateOptionsInput {
   provider?: string;
   model?: string;
   mode?: string;
+  thinking?: string;
   cwd?: string;
   maxRuns?: string;
   expiresIn?: string;
@@ -375,6 +380,10 @@ function buildNewAgentConfigPatch(
   if (options.mode !== undefined) {
     const trimmed = options.mode.trim();
     patch.modeId = trimmed.length > 0 ? trimmed : null;
+  }
+  if (options.thinking !== undefined) {
+    const trimmed = options.thinking.trim();
+    patch.thinkingOptionId = trimmed.length > 0 ? trimmed : null;
   }
   if (options.cwd !== undefined) {
     const trimmed = options.cwd.trim();

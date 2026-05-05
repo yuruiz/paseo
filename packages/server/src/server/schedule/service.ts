@@ -72,6 +72,14 @@ function applyNewAgentConfig(
       delete config.modeId;
     }
   }
+  if (patch.thinkingOptionId !== undefined) {
+    const trimmed = patch.thinkingOptionId?.trim();
+    if (trimmed) {
+      config.thinkingOptionId = trimmed;
+    } else {
+      delete config.thinkingOptionId;
+    }
+  }
   return { ...target, config };
 }
 

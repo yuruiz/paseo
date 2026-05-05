@@ -107,6 +107,67 @@ describe("parseScheduleCreateInput first-run timing", () => {
   });
 });
 
+describe("parseScheduleCreateInput agent config flags", () => {
+  beforeEach(() => {
+    vi.spyOn(process, "cwd").mockReturnValue("/local/project");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("--mode and --thinking are written to new-agent config", () => {
+    const input = parseScheduleCreateInput({
+      ...baseOptions,
+      mode: "bypassPermissions",
+      thinking: "max",
+    });
+    expect(input.target).toEqual({
+      type: "new-agent",
+      config: {
+        provider: "claude",
+        cwd: "/local/project",
+        modeId: "bypassPermissions",
+        thinkingOptionId: "max",
+      },
+    });
+  });
+
+  test("--provider model shorthand carries through with --thinking", () => {
+    const input = parseScheduleCreateInput({
+      ...baseOptions,
+      provider: "claude/claude-opus-4-7[1m]",
+      mode: "bypassPermissions",
+      thinking: "max",
+    });
+    expect(input.target).toEqual({
+      type: "new-agent",
+      config: {
+        provider: "claude",
+        cwd: "/local/project",
+        model: "claude-opus-4-7[1m]",
+        modeId: "bypassPermissions",
+        thinkingOptionId: "max",
+      },
+    });
+  });
+
+  test("--thinking on a non-new-agent target is rejected", () => {
+    expect(() =>
+      parseScheduleCreateInput({
+        ...baseOptions,
+        target: "11111111-1111-1111-1111-111111111111",
+        thinking: "max",
+      }),
+    ).toThrow(
+      expect.objectContaining({
+        code: "INVALID_TARGET",
+        message: expect.stringContaining("--thinking"),
+      }),
+    );
+  });
+});
+
 describe("parseScheduleUpdateInput", () => {
   test("rejects calls with no fields to update", () => {
     expect(() => parseScheduleUpdateInput({ id: "abc" })).toThrow(
@@ -180,6 +241,17 @@ describe("parseScheduleUpdateInput", () => {
     expect(parseScheduleUpdateInput({ id: "abc", mode: "" })).toEqual({
       id: "abc",
       newAgentConfig: { modeId: null },
+    });
+  });
+
+  test("--thinking sets thinkingOptionId; empty value clears it", () => {
+    expect(parseScheduleUpdateInput({ id: "abc", thinking: "max" })).toEqual({
+      id: "abc",
+      newAgentConfig: { thinkingOptionId: "max" },
+    });
+    expect(parseScheduleUpdateInput({ id: "abc", thinking: "" })).toEqual({
+      id: "abc",
+      newAgentConfig: { thinkingOptionId: null },
     });
   });
 
