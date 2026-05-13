@@ -304,7 +304,7 @@ export interface CompactionTimelineItem {
 
 export type AgentTimelineItem =
   | { type: "user_message"; text: string; messageId?: string }
-  | { type: "assistant_message"; text: string }
+  | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem
   | { type: "todo"; items: { text: string; completed: boolean }[] }
@@ -357,6 +357,10 @@ export type AgentStreamEvent =
       reason: "finished" | "error" | "permission";
       timestamp: string;
     };
+
+export function getAgentStreamEventTurnId(event: AgentStreamEvent): string | undefined {
+  return "turnId" in event ? event.turnId : undefined;
+}
 
 export type AgentPermissionRequestKind = "tool" | "plan" | "question" | "mode" | "other";
 
@@ -427,6 +431,13 @@ export interface AgentSlashCommand {
 
 export interface ListPersistedAgentsOptions {
   limit?: number;
+  /**
+   * Optional cwd hint. Providers that can cheaply pre-filter persisted
+   * sessions by working directory should do so before doing expensive
+   * work like fetching turn timelines. Providers that can't filter
+   * cheaply may ignore this hint.
+   */
+  cwd?: string;
 }
 
 export interface PersistedAgentDescriptor {
@@ -469,6 +480,7 @@ export interface AgentSessionConfig {
 }
 
 export interface AgentLaunchContext {
+  agentId?: string;
   env?: Record<string, string>;
 }
 
@@ -513,6 +525,17 @@ export interface AgentSession {
   setModel?(modelId: string | null): Promise<void>;
   setThinkingOption?(thinkingOptionId: string | null): Promise<void>;
   setFeature?(featureId: string, value: unknown): Promise<void>;
+  /**
+   * Out-of-band prompt handler. When non-null, the manager runs the returned
+   * handler instead of allocating a turn. The handler emits stream events
+   * directly via the provided `emit` callback, which routes through the
+   * manager's persistence + broadcast pipeline. The active foreground turn
+   * (if any) is left untouched, so this is how mid-turn side-effect commands
+   * (e.g. /goal pause) reach the provider without canceling the running turn.
+   */
+  tryHandleOutOfBand?(prompt: AgentPromptInput): {
+    run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
+  } | null;
 }
 
 export interface ListModelsOptions {
@@ -547,4 +570,9 @@ export interface AgentClient {
    */
   isAvailable(): Promise<boolean>;
   getDiagnostic?(): Promise<{ diagnostic: string }>;
+  /**
+   * Archive a persisted session in the native provider (best-effort).
+   * Called when Paseo archives an agent so the provider's own UI reflects the same state.
+   */
+  archiveNativeSession?(handle: AgentPersistenceHandle): Promise<void>;
 }

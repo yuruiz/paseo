@@ -95,6 +95,7 @@ vi.mock("lucide-react-native", () => {
   const icon = (name: string) => () => React.createElement("span", { "data-icon": name });
   return {
     ChevronRight: icon("ChevronRight"),
+    Plus: icon("Plus"),
     RotateCw: icon("RotateCw"),
   };
 });
@@ -142,6 +143,10 @@ vi.mock("@/components/provider-diagnostic-sheet", () => ({
       "data-testid": "provider-diagnostic-sheet",
       "data-provider": provider,
     }),
+}));
+
+vi.mock("@/components/add-provider-modal", () => ({
+  AddProviderModal: () => null,
 }));
 
 vi.mock("@/hooks/use-providers-snapshot", () => ({
@@ -323,7 +328,7 @@ describe("ProvidersSection", () => {
     expect(sheet?.getAttribute("data-provider")).toBe("codex");
   });
 
-  it("toggles the provider enabled flag through patchConfig when the switch is pressed", () => {
+  it("toggles the provider enabled flag through patchConfig when the switch is pressed", async () => {
     snapshotState.entries = [claudeEntry];
     configState.config = makeConfig();
 
@@ -334,7 +339,7 @@ describe("ProvidersSection", () => {
     expect(switchEl).not.toBeNull();
     expect(switchEl?.getAttribute("aria-checked")).toBe("true");
 
-    act(() => {
+    await act(async () => {
       switchEl?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
     });
 
@@ -342,6 +347,26 @@ describe("ProvidersSection", () => {
     expect(patchConfigMock).toHaveBeenCalledWith({
       providers: { claude: { enabled: false } },
     });
+    expect(refreshMock).not.toHaveBeenCalled();
     expect(container?.querySelector('[data-testid="provider-diagnostic-sheet"]')).toBeNull();
+  });
+
+  it("forces a provider snapshot refresh from the settings refresh action", async () => {
+    snapshotState.entries = [claudeEntry];
+    configState.config = makeConfig();
+
+    render();
+
+    const refreshButton = container?.querySelector<HTMLElement>(
+      '[role="button"][aria-label="Refresh providers"]',
+    );
+    expect(refreshButton).not.toBeNull();
+
+    await act(async () => {
+      refreshButton?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(refreshMock).toHaveBeenCalledTimes(1);
+    expect(patchConfigMock).not.toHaveBeenCalled();
   });
 });

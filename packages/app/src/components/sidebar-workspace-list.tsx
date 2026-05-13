@@ -81,7 +81,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { SyncedLoader } from "@/components/synced-loader";
 import { useToast } from "@/contexts/toast-context";
-import { useCheckoutGitActionsStore } from "@/stores/checkout-git-actions-store";
+import { useCheckoutGitActionsStore } from "@/git/actions-store";
 import { hasVisibleOrderChanged, mergeWithRemainder } from "@/utils/sidebar-reorder";
 import { decideLongPressMove } from "@/utils/sidebar-gesture-arbitration";
 import { confirmDialog } from "@/utils/confirm-dialog";
@@ -95,25 +95,22 @@ import { Shortcut } from "@/components/ui/shortcut";
 import type { ShortcutKey } from "@/utils/format-shortcut";
 import { useShortcutKeys } from "@/hooks/use-shortcut-keys";
 import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
-import { type PrHint, useWorkspacePrHint } from "@/hooks/use-checkout-pr-status-query";
+import { type PrHint, useWorkspacePrHint } from "@/git/use-pr-status-query";
 import { buildSidebarProjectRowModel } from "@/utils/sidebar-project-row-model";
-import {
-  useIsNavigationProjectActive,
-  useIsNavigationWorkspaceSelected,
-} from "@/stores/navigation-active-workspace-store";
+import { useActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
 import { useSessionStore, type WorkspaceDescriptor } from "@/stores/session-store";
 import { useWorkspaceFields } from "@/stores/session-store-hooks";
 import { redirectIfArchivingActiveWorkspace } from "@/utils/sidebar-workspace-archive-redirect";
-import {
-  clearWorkspaceArchivePending,
-  markWorkspaceArchivePending,
-} from "@/contexts/session-workspace-upserts";
 import { openExternalUrl } from "@/utils/open-external-url";
 import {
   requireWorkspaceExecutionDirectory,
-  resolveWorkspaceMapKeyByIdentity,
   resolveWorkspaceExecutionDirectory,
 } from "@/utils/workspace-execution";
+import { confirmRiskyWorktreeArchive } from "@/git/worktree-archive-warning";
+import {
+  archiveWorkspaceOptimistically,
+  archiveWorkspacesOptimistically,
+} from "@/workspace/workspace-archive";
 import { WorkspaceHoverCard } from "@/components/workspace-hover-card";
 import { GitHubIcon } from "@/components/icons/github-icon";
 import { isWeb as platformIsWeb, isNative as platformIsNative } from "@/constants/platform";
@@ -129,35 +126,6 @@ const workspaceKeyExtractor = (workspace: SidebarWorkspaceEntry) => workspace.wo
 
 const projectKeyExtractor = (project: SidebarProjectEntry) => project.projectKey;
 
-function hideWorkspaceOptimistically(workspace: SidebarWorkspaceEntry): WorkspaceDescriptor | null {
-  const workspaces = useSessionStore.getState().sessions[workspace.serverId]?.workspaces;
-  const workspaceKey = resolveWorkspaceMapKeyByIdentity({
-    workspaces,
-    workspaceId: workspace.workspaceId,
-  });
-  const snapshot = workspaceKey ? (workspaces?.get(workspaceKey) ?? null) : null;
-  markWorkspaceArchivePending({
-    serverId: workspace.serverId,
-    workspaceId: workspace.workspaceId,
-    workspaceDirectory: workspace.workspaceDirectory,
-  });
-  useSessionStore.getState().removeWorkspace(workspace.serverId, workspace.workspaceId);
-  return snapshot;
-}
-
-function restoreOptimisticallyHiddenWorkspace(input: {
-  serverId: string;
-  workspaceId: string;
-  snapshot: WorkspaceDescriptor | null;
-}): void {
-  clearWorkspaceArchivePending({
-    serverId: input.serverId,
-    workspaceId: input.workspaceId,
-  });
-  if (input.snapshot) {
-    useSessionStore.getState().mergeWorkspaces(input.serverId, [input.snapshot]);
-  }
-}
 const WORKSPACE_STATUS_DOT_WIDTH = 14;
 const DEFAULT_STATUS_DOT_SIZE = 7;
 const EMPHASIZED_STATUS_DOT_SIZE = 9;
@@ -1482,6 +1450,7 @@ function WorkspaceRowWithMenu({
   isCreating?: boolean;
 }) {
   const toast = useToast();
+  const activeWorkspaceSelection = useActiveWorkspaceSelection();
   const archiveWorktree = useCheckoutGitActionsStore((state) => state.archiveWorktree);
   const [isArchivingWorkspace, setIsArchivingWorkspace] = useState(false);
   const workspaceDirectory = resolveWorkspaceExecutionDirectory({
@@ -1502,101 +1471,96 @@ function WorkspaceRowWithMenu({
     redirectIfArchivingActiveWorkspace({
       serverId: workspace.serverId,
       workspaceId: workspace.workspaceId,
+      activeWorkspaceSelection,
     });
-  }, [workspace.serverId, workspace.workspaceId]);
+  }, [activeWorkspaceSelection, workspace.serverId, workspace.workspaceId]);
 
-  const handleArchiveWorktree = useCallback(() => {
+  const archiveWorktreeAfterConfirmation = useCallback(async () => {
     if (isArchiving) {
       return;
     }
 
-    void (async () => {
-      const confirmed = await confirmDialog({
-        title: "Archive worktree?",
-        message: `Archive "${workspace.name}"?\n\nThe worktree will be removed from disk, terminals will be stopped, and agents inside will be archived.\n\nYour branch is still accessible if you committed.`,
-        confirmLabel: "Archive",
-        cancelLabel: "Cancel",
-        destructive: true,
+    const confirmed = await confirmRiskyWorktreeArchive({
+      worktreeName: workspace.name,
+      isDirty: workspace.archiveHasUncommittedChanges,
+      aheadOfOrigin: workspace.archiveUnpushedCommitCount,
+      diffStat: workspace.diffStat,
+    });
+
+    if (!confirmed) {
+      return;
+    }
+    let archiveDirectory: string;
+    try {
+      archiveDirectory = requireWorkspaceExecutionDirectory({
+        workspaceId: workspace.workspaceId,
+        workspaceDirectory: workspace.workspaceDirectory,
       });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Workspace path not available");
+      return;
+    }
 
-      if (!confirmed) {
-        return;
-      }
-      let archiveDirectory: string;
-      try {
-        archiveDirectory = requireWorkspaceExecutionDirectory({
-          workspaceId: workspace.workspaceId,
-          workspaceDirectory: workspace.workspaceDirectory,
-        });
-      } catch (error) {
-        toast.error(error instanceof Error ? error.message : "Workspace path not available");
-        return;
-      }
+    if (!archiveDirectory) {
+      toast.error("Workspace path not available");
+      return;
+    }
 
-      if (!archiveDirectory) {
-        toast.error("Workspace path not available");
-        return;
-      }
+    redirectAfterArchive();
 
-      redirectAfterArchive();
-
-      void archiveWorktree({
-        serverId: workspace.serverId,
-        cwd: archiveDirectory,
-        worktreePath: archiveDirectory,
-      }).catch((error) => {
-        const message = error instanceof Error ? error.message : "Failed to archive worktree";
-        toast.error(message);
-      });
-    })();
+    void archiveWorktree({
+      serverId: workspace.serverId,
+      cwd: archiveDirectory,
+      worktreePath: archiveDirectory,
+    }).catch((error) => {
+      const message = error instanceof Error ? error.message : "Failed to archive worktree";
+      toast.error(message);
+    });
   }, [archiveWorktree, isArchiving, redirectAfterArchive, toast, workspace]);
 
-  const handleArchiveWorkspace = useCallback(() => {
+  const handleArchiveWorktree = useCallback(() => {
+    void archiveWorktreeAfterConfirmation();
+  }, [archiveWorktreeAfterConfirmation]);
+
+  const hideWorkspaceAfterConfirmation = useCallback(async () => {
     if (isArchivingWorkspace) {
       return;
     }
 
-    void (async () => {
-      const confirmed = await confirmDialog({
-        title: "Hide workspace?",
-        message: `Hide "${workspace.name}" from the sidebar?\n\nFiles on disk will not be changed.`,
-        confirmLabel: "Hide",
-        cancelLabel: "Cancel",
-        destructive: true,
+    const confirmed = await confirmDialog({
+      title: "Hide workspace?",
+      message: `Hide "${workspace.name}" from the sidebar?\n\nFiles on disk will not be changed.`,
+      confirmLabel: "Hide",
+      cancelLabel: "Cancel",
+      destructive: true,
+    });
+    if (!confirmed) {
+      return;
+    }
+
+    const client = getHostRuntimeStore().getClient(workspace.serverId);
+    if (!client) {
+      toast.error("Host is not connected");
+      return;
+    }
+
+    setIsArchivingWorkspace(true);
+    try {
+      await archiveWorkspaceOptimistically({
+        client,
+        workspace,
+        afterHide: redirectAfterArchive,
       });
-      if (!confirmed) {
-        return;
-      }
-
-      const client = getHostRuntimeStore().getClient(workspace.serverId);
-      if (!client) {
-        toast.error("Host is not connected");
-        return;
-      }
-
-      setIsArchivingWorkspace(true);
-      const snapshot = hideWorkspaceOptimistically(workspace);
-      redirectAfterArchive();
-
-      void (async () => {
-        try {
-          const payload = await client.archiveWorkspace(workspace.workspaceId);
-          if (payload.error) {
-            throw new Error(payload.error);
-          }
-        } catch (error) {
-          restoreOptimisticallyHiddenWorkspace({
-            serverId: workspace.serverId,
-            workspaceId: workspace.workspaceId,
-            snapshot,
-          });
-          toast.error(error instanceof Error ? error.message : "Failed to hide workspace");
-        } finally {
-          setIsArchivingWorkspace(false);
-        }
-      })();
-    })();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to hide workspace");
+    } finally {
+      setIsArchivingWorkspace(false);
+    }
   }, [isArchivingWorkspace, redirectAfterArchive, toast, workspace]);
+
+  const handleArchiveWorkspace = useCallback(() => {
+    void hideWorkspaceAfterConfirmation();
+  }, [hideWorkspaceAfterConfirmation]);
 
   const handleCopyPath = useCallback(() => {
     let copyTargetDirectory: string;
@@ -1627,7 +1591,7 @@ function WorkspaceRowWithMenu({
     priority: 0,
     handle: () => {
       if (isWorktree) {
-        handleArchiveWorktree();
+        void archiveWorktreeAfterConfirmation();
       } else {
         handleArchiveWorkspace();
       }
@@ -1686,13 +1650,15 @@ function NonGitProjectRowWithMenuContent({
 }) {
   const toast = useToast();
   const contextMenu = useContextMenu();
+  const activeWorkspaceSelection = useActiveWorkspaceSelection();
   const [isArchivingWorkspace, setIsArchivingWorkspace] = useState(false);
   const redirectAfterArchive = useCallback(() => {
     redirectIfArchivingActiveWorkspace({
       serverId: workspace.serverId,
       workspaceId: workspace.workspaceId,
+      activeWorkspaceSelection,
     });
-  }, [workspace.serverId, workspace.workspaceId]);
+  }, [activeWorkspaceSelection, workspace.serverId, workspace.workspaceId]);
 
   const handleArchiveWorkspace = useCallback(() => {
     if (isArchivingWorkspace) {
@@ -1718,21 +1684,14 @@ function NonGitProjectRowWithMenuContent({
       }
 
       setIsArchivingWorkspace(true);
-      const snapshot = hideWorkspaceOptimistically(workspace);
-      redirectAfterArchive();
-
       void (async () => {
         try {
-          const payload = await client.archiveWorkspace(workspace.workspaceId);
-          if (payload.error) {
-            throw new Error(payload.error);
-          }
-        } catch (error) {
-          restoreOptimisticallyHiddenWorkspace({
-            serverId: workspace.serverId,
-            workspaceId: workspace.workspaceId,
-            snapshot,
+          await archiveWorkspaceOptimistically({
+            client,
+            workspace,
+            afterHide: redirectAfterArchive,
           });
+        } catch (error) {
           toast.error(error instanceof Error ? error.message : "Failed to hide workspace");
         } finally {
           setIsArchivingWorkspace(false);
@@ -1839,11 +1798,11 @@ function FlattenedProjectRow({
   selectionEnabled: boolean;
 }) {
   const workspace = useSidebarWorkspaceEntry(serverId, rowModel.workspace.workspaceId);
-  const selected = useIsNavigationWorkspaceSelected({
-    serverId,
-    workspaceId: rowModel.workspace.workspaceId,
-    enabled: selectionEnabled,
-  });
+  const activeWorkspaceSelection = useActiveWorkspaceSelection();
+  const selected =
+    selectionEnabled &&
+    activeWorkspaceSelection?.serverId === serverId &&
+    activeWorkspaceSelection.workspaceId === rowModel.workspace.workspaceId;
 
   if (!workspace) {
     return null;
@@ -1970,11 +1929,11 @@ function WorkspaceRow({
   selectionEnabled: boolean;
 }) {
   const hydratedWorkspace = useSidebarWorkspaceEntry(workspace.serverId, workspace.workspaceId);
-  const selected = useIsNavigationWorkspaceSelected({
-    serverId: workspace.serverId,
-    workspaceId: workspace.workspaceId,
-    enabled: selectionEnabled,
-  });
+  const activeWorkspaceSelection = useActiveWorkspaceSelection();
+  const selected =
+    selectionEnabled &&
+    activeWorkspaceSelection?.serverId === workspace.serverId &&
+    activeWorkspaceSelection.workspaceId === workspace.workspaceId;
 
   if (!hydratedWorkspace) {
     return null;
@@ -2050,11 +2009,11 @@ function ProjectBlock({
     () => project.workspaces.map((workspace) => workspace.workspaceId),
     [project.workspaces],
   );
-  const isProjectActive = useIsNavigationProjectActive({
-    serverId,
-    workspaceIds: projectWorkspaceIds,
-    enabled: selectionEnabled,
-  });
+  const activeWorkspaceSelection = useActiveWorkspaceSelection();
+  const isProjectActive =
+    selectionEnabled &&
+    activeWorkspaceSelection?.serverId === serverId &&
+    projectWorkspaceIds.includes(activeWorkspaceSelection.workspaceId);
 
   const renderWorkspaceRow = useCallback(
     (
@@ -2144,33 +2103,11 @@ function ProjectBlock({
       }
 
       setIsRemovingProject(true);
-      const snapshots = new Map(
-        project.workspaces.map((workspace) => [
-          workspace.workspaceId,
-          hideWorkspaceOptimistically(workspace),
-        ]),
-      );
-
-      const isRejected = (r: PromiseSettledResult<unknown>) => r.status === "rejected";
-      void Promise.allSettled(
-        project.workspaces.map(async (ws) => {
-          try {
-            const payload = await client.archiveWorkspace(ws.workspaceId);
-            if (payload.error) {
-              throw new Error(payload.error);
-            }
-          } catch (error) {
-            restoreOptimisticallyHiddenWorkspace({
-              serverId,
-              workspaceId: ws.workspaceId,
-              snapshot: snapshots.get(ws.workspaceId) ?? null,
-            });
-            throw error;
-          }
-        }),
-      ).then((results) => {
-        const failed = results.filter(isRejected);
-        if (failed.length > 0) {
+      void archiveWorkspacesOptimistically({
+        client,
+        workspaces: project.workspaces,
+      }).then((failures) => {
+        if (failures.length > 0) {
           toast.error("Failed to remove some workspaces");
         }
         setIsRemovingProject(false);

@@ -7,6 +7,8 @@ import { randomUUID } from "node:crypto";
 import { createTestLogger } from "../../test-utils/test-logger.js";
 import { AgentManager } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
+import { PARENT_AGENT_ID_LABEL } from "../../shared/agent-labels.js";
+import type { StoredAgentRecord } from "./agent-storage.js";
 import type {
   AgentClient,
   AgentCreateSessionOptions,
@@ -79,6 +81,20 @@ function createPersistedDescriptor(args: {
     },
     timeline: [],
   };
+}
+
+function expectArchivedAgentRecord(
+  record: StoredAgentRecord | null,
+  expectedLastStatus: "closed" | "idle",
+): void {
+  expect(record).not.toBeNull();
+  expect(record?.archivedAt).toEqual(
+    expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/),
+  );
+  expect(record?.lastStatus).toBe(expectedLastStatus);
+  expect(record?.requiresAttention).toBe(false);
+  expect(record?.attentionReason).toBeNull();
+  expect(record?.attentionTimestamp).toBeNull();
 }
 
 class TestAgentClient implements AgentClient {
@@ -700,6 +716,7 @@ test("createAgent passes daemon launch env through the provider launch context",
     modeId: "auto",
   });
   expect(client.lastLaunchContext).toEqual({
+    agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
     },
@@ -1074,6 +1091,17 @@ test("resumeAgentFromPersistence keeps metadata config, applies overrides, and p
       return new TestAgentSession(config);
     }
 
+    async listModels() {
+      return [
+        {
+          provider: "codex",
+          id: "gpt-5.4",
+          label: "GPT-5.4",
+          isDefault: true,
+        },
+      ];
+    }
+
     async resumeSession(
       handle: AgentPersistenceHandle,
       overrides?: Partial<AgentSessionConfig>,
@@ -1140,6 +1168,8 @@ test("resumeAgentFromPersistence keeps metadata config, applies overrides, and p
     },
   });
   expect(client.lastResumeOverrides).toMatchObject({
+    model: "gpt-5.4",
+    modeId: "auto",
     systemPrompt: "new prompt",
     mcpServers: {
       paseo: {
@@ -1150,6 +1180,7 @@ test("resumeAgentFromPersistence keeps metadata config, applies overrides, and p
     },
   });
   expect(client.lastResumeLaunchContext).toEqual({
+    agentId: resumed.id,
     env: {
       PASEO_AGENT_ID: resumed.id,
     },
@@ -1254,6 +1285,7 @@ test("reloadAgentSession passes daemon launch env through the provider launch co
   });
 
   expect(client.lastCreateLaunchContext).toEqual({
+    agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
     },
@@ -1264,6 +1296,7 @@ test("reloadAgentSession passes daemon launch env through the provider launch co
   });
 
   expect(client.lastResumeLaunchContext).toEqual({
+    agentId: snapshot.id,
     env: {
       PASEO_AGENT_ID: snapshot.id,
     },
@@ -3761,6 +3794,275 @@ test("archiveAgent persists archivedAt and updatedAt before emitting closed stat
   expect(lifecycles.slice(-2)).toEqual(["idle", "closed"]);
 });
 
+test("archiveAgent cascade archives in-memory children with the full archive contract", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cascade-contract-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: {
+      codex: new TestAgentClient(),
+    },
+    registry: storage,
+    logger,
+  });
+
+  const parent = await manager.createAgent({
+    provider: "codex",
+    cwd: workdir,
+    title: "Parent",
+  });
+  const child = await manager.createAgent(
+    {
+      provider: "codex",
+      cwd: workdir,
+      title: "Child",
+    },
+    undefined,
+    { labels: { [PARENT_AGENT_ID_LABEL]: parent.id } },
+  );
+  const unrelated = await manager.createAgent({
+    provider: "codex",
+    cwd: workdir,
+    title: "Unrelated",
+  });
+
+  await manager.archiveAgent(parent.id);
+
+  const storedParent = await storage.get(parent.id);
+  const storedChild = await storage.get(child.id);
+  const storedUnrelated = await storage.get(unrelated.id);
+
+  expectArchivedAgentRecord(storedParent, "closed");
+  expectArchivedAgentRecord(storedChild, "closed");
+  expect(storedUnrelated?.archivedAt).toBeUndefined();
+});
+
+test("archiveAgent cascade closes a running child runtime", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cascade-running-child-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const finishRun = deferred<void>();
+
+  class RunningChildSession extends TestAgentSession {
+    closeCalled = false;
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = "running-child-turn";
+      void (async () => {
+        this.pushEvent({ type: "turn_started", provider: this.provider, turnId });
+        await finishRun.promise;
+        this.pushEvent({ type: "turn_completed", provider: this.provider, turnId });
+      })();
+      return { turnId };
+    }
+
+    override async close(): Promise<void> {
+      this.closeCalled = true;
+    }
+  }
+
+  class RunningChildClient extends TestAgentClient {
+    readonly sessions: RunningChildSession[] = [];
+
+    override async createSession(config: AgentSessionConfig): Promise<AgentSession> {
+      const session = new RunningChildSession(config);
+      this.sessions.push(session);
+      return session;
+    }
+  }
+
+  const client = new RunningChildClient();
+  const manager = new AgentManager({
+    clients: {
+      codex: client,
+    },
+    registry: storage,
+    logger,
+  });
+  const parent = await manager.createAgent({
+    provider: "codex",
+    cwd: workdir,
+    title: "Parent",
+  });
+  const child = await manager.createAgent(
+    {
+      provider: "codex",
+      cwd: workdir,
+      title: "Running Child",
+    },
+    undefined,
+    { labels: { [PARENT_AGENT_ID_LABEL]: parent.id } },
+  );
+  const childSession = client.sessions[1];
+  const childLifecycleEvents: string[] = [];
+  const unsubscribe = manager.subscribe(
+    (event) => {
+      if (event.type === "agent_state" && event.agent.id === child.id) {
+        childLifecycleEvents.push(event.agent.lifecycle);
+      }
+    },
+    { agentId: child.id, replayState: false },
+  );
+  const childRun = manager.streamAgent(child.id, "keep running");
+  const drainChildRun = (async () => {
+    for await (const _event of childRun) {
+      // Drain the foreground turn while archive closes it.
+    }
+  })();
+
+  await manager.waitForAgentRunStart(child.id);
+
+  await manager.archiveAgent(parent.id);
+  finishRun.resolve();
+  await drainChildRun;
+  unsubscribe();
+
+  expect(childSession?.closeCalled).toBe(true);
+  expect(manager.getAgent(child.id)).toBeNull();
+  expect(childLifecycleEvents).toContain("closed");
+});
+
+test("archiveAgent cascade archives off-memory children with the full archive contract", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cascade-off-memory-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: {
+      codex: new TestAgentClient(),
+    },
+    registry: storage,
+    logger,
+  });
+  const parent = await manager.createAgent({
+    provider: "codex",
+    cwd: workdir,
+    title: "Parent",
+  });
+  const child = await manager.createAgent(
+    {
+      provider: "codex",
+      cwd: workdir,
+      title: "Off-memory Child",
+    },
+    undefined,
+    { labels: { [PARENT_AGENT_ID_LABEL]: parent.id } },
+  );
+  const managerInternals = manager as unknown as {
+    agents: Map<string, unknown>;
+  };
+  managerInternals.agents.delete(child.id);
+
+  await manager.archiveAgent(parent.id);
+
+  expectArchivedAgentRecord(await storage.get(child.id), "idle");
+});
+
+test("archiveAgent cascade notifies subscribers for in-memory and off-memory children", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cascade-notifications-"));
+  const storagePath = join(workdir, "agents");
+  const storage = new AgentStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: {
+      codex: new TestAgentClient(),
+    },
+    registry: storage,
+    logger,
+  });
+  const parent = await manager.createAgent({
+    provider: "codex",
+    cwd: workdir,
+    title: "Parent",
+  });
+  const inMemoryChild = await manager.createAgent(
+    {
+      provider: "codex",
+      cwd: workdir,
+      title: "In-memory Child",
+    },
+    undefined,
+    { labels: { [PARENT_AGENT_ID_LABEL]: parent.id } },
+  );
+  const offMemoryChild = await manager.createAgent(
+    {
+      provider: "codex",
+      cwd: workdir,
+      title: "Off-memory Child",
+    },
+    undefined,
+    { labels: { [PARENT_AGENT_ID_LABEL]: parent.id } },
+  );
+  const managerInternals = manager as unknown as {
+    agents: Map<string, unknown>;
+  };
+  managerInternals.agents.delete(offMemoryChild.id);
+  const cascadedChildEvents: string[] = [];
+  const unsubscribe = manager.subscribe(
+    (event) => {
+      if (event.type !== "agent_state") {
+        return;
+      }
+      if (event.agent.id === inMemoryChild.id || event.agent.id === offMemoryChild.id) {
+        cascadedChildEvents.push(event.agent.id);
+      }
+    },
+    { replayState: false },
+  );
+
+  await manager.archiveAgent(parent.id);
+  unsubscribe();
+
+  expect({
+    inMemoryChildNotified: cascadedChildEvents.includes(inMemoryChild.id),
+    offMemoryChildNotified: cascadedChildEvents.includes(offMemoryChild.id),
+  }).toEqual({
+    inMemoryChildNotified: true,
+    offMemoryChildNotified: true,
+  });
+});
+
+test("archiveAgent cascade surfaces partial child archive failures", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-cascade-partial-failure-"));
+  const storagePath = join(workdir, "agents");
+  let failingChildId: string | null = null;
+
+  class FailingChildArchiveStorage extends AgentStorage {
+    override async upsert(record: StoredAgentRecord): Promise<void> {
+      if (record.id === failingChildId && record.archivedAt) {
+        throw new Error(`Injected cascade archive failure for ${record.id}`);
+      }
+      await super.upsert(record);
+    }
+  }
+
+  const storage = new FailingChildArchiveStorage(storagePath, logger);
+  const manager = new AgentManager({
+    clients: {
+      codex: new TestAgentClient(),
+    },
+    registry: storage,
+    logger,
+  });
+  const parent = await manager.createAgent({
+    provider: "codex",
+    cwd: workdir,
+    title: "Parent",
+  });
+  const child = await manager.createAgent(
+    {
+      provider: "codex",
+      cwd: workdir,
+      title: "Failing Child",
+    },
+    undefined,
+    { labels: { [PARENT_AGENT_ID_LABEL]: parent.id } },
+  );
+  failingChildId = child.id;
+
+  await expect(manager.archiveAgent(parent.id)).rejects.toThrow(
+    `Injected cascade archive failure for ${child.id}`,
+  );
+});
+
 test("turn_failed emits a system error assistant timeline message and keeps error lifecycle", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-turn-failed-"));
   const storagePath = join(workdir, "agents");
@@ -3892,6 +4194,8 @@ test("turn_failed surfaces provider code and diagnostic in system error message"
   });
 
   await expect(manager.runAgent(agent.id, "hello")).rejects.toThrow("Provider execution failed");
+
+  expect(manager.getAgent(agent.id)?.lastError).toBe("Provider execution failed");
 
   const systemError = manager
     .getTimeline(agent.id)
@@ -5220,3 +5524,109 @@ test("replaceAgentRun succeeds when foreground turn terminal event is never deli
   expect(manager.getAgent(snapshot.id)?.lifecycle).toBe("idle");
   expect(manager.getAgent(snapshot.id)?.activeForegroundTurnId).toBeNull();
 }, 10_000);
+
+class RecordingPersistedAgentsClient implements AgentClient {
+  readonly capabilities = TEST_CAPABILITIES;
+  calls = 0;
+
+  constructor(public readonly provider: AgentProvider) {}
+
+  async isAvailable(): Promise<boolean> {
+    return true;
+  }
+
+  async createSession(): Promise<AgentSession> {
+    throw new Error(`unexpected createSession for ${this.provider}`);
+  }
+
+  async resumeSession(): Promise<AgentSession> {
+    throw new Error(`unexpected resumeSession for ${this.provider}`);
+  }
+
+  async listModels() {
+    return [];
+  }
+
+  async listPersistedAgents(): Promise<PersistedAgentDescriptor[]> {
+    this.calls += 1;
+    return [
+      {
+        provider: this.provider,
+        sessionId: `${this.provider}-session`,
+        cwd: "/tmp/recent",
+        title: null,
+        lastActivityAt: new Date("2026-01-01T00:00:00Z"),
+        persistence: { provider: this.provider, sessionId: `${this.provider}-session` },
+        timeline: [],
+      },
+    ];
+  }
+}
+
+test.each([
+  [
+    "disabled",
+    "claude",
+    "codex",
+    {
+      claude: { enabled: true, derivedFromProviderId: null },
+      codex: { enabled: false, derivedFromProviderId: null },
+    },
+  ],
+  [
+    "derived",
+    "claude",
+    "zai",
+    {
+      claude: { enabled: true, derivedFromProviderId: null },
+      zai: { enabled: true, derivedFromProviderId: "claude" },
+    },
+  ],
+  [
+    "outside importable allowlist",
+    "claude",
+    "gemini",
+    {
+      claude: { enabled: true, derivedFromProviderId: null },
+      gemini: { enabled: true, derivedFromProviderId: null },
+    },
+  ],
+])(
+  "listImportablePersistedAgents skips %s providers in fan-out",
+  async (_reason, includedProvider, skippedProvider, providerDefinitions) => {
+    const includedClient = new RecordingPersistedAgentsClient(includedProvider);
+    const skippedClient = new RecordingPersistedAgentsClient(skippedProvider);
+    const manager = new AgentManager({
+      clients: { [includedProvider]: includedClient, [skippedProvider]: skippedClient },
+      providerDefinitions,
+      logger,
+    });
+
+    const result = await manager.listImportablePersistedAgents();
+
+    expect(includedClient.calls).toBe(1);
+    expect(skippedClient.calls).toBe(0);
+    expect(result.map((d) => d.provider)).toEqual([includedProvider]);
+  },
+);
+
+test("listImportablePersistedAgents narrows to the providerFilter when supplied", async () => {
+  const claudeClient = new RecordingPersistedAgentsClient("claude");
+  const codexClient = new RecordingPersistedAgentsClient("codex");
+  const manager = new AgentManager({
+    clients: { claude: claudeClient, codex: codexClient },
+    providerDefinitions: {
+      claude: { enabled: true, derivedFromProviderId: null },
+      codex: { enabled: true, derivedFromProviderId: null },
+    },
+    logger,
+  });
+
+  const result = await manager.listImportablePersistedAgents({
+    providerFilter: new Set(["claude"]),
+  });
+
+  expect(claudeClient.calls).toBe(1);
+  expect(codexClient.calls).toBe(0);
+  expect(result.map((d) => d.provider)).toEqual(["claude"]);
+});

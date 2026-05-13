@@ -3,13 +3,7 @@ import { PortalProvider } from "@gorhom/portal";
 import { QueryClientProvider } from "@tanstack/react-query";
 import * as Linking from "expo-linking";
 import * as Notifications from "expo-notifications";
-import {
-  Stack,
-  useGlobalSearchParams,
-  useNavigationContainerRef,
-  usePathname,
-  useRouter,
-} from "expo-router";
+import { Stack, useGlobalSearchParams, usePathname, useRouter } from "expo-router";
 import {
   createContext,
   type ReactNode,
@@ -65,23 +59,18 @@ import { useLatchedBoolean } from "@/hooks/use-latched-boolean";
 import { useOpenProject } from "@/hooks/use-open-project";
 import { useAppSettings } from "@/hooks/use-settings";
 import { useStableEvent } from "@/hooks/use-stable-event";
-import { navigateToWorkspace } from "@/hooks/use-workspace-navigation";
 import { keyboardActionDispatcher } from "@/keyboard/keyboard-action-dispatcher";
 import { polyfillCrypto } from "@/polyfills/crypto";
 import { queryClient } from "@/query/query-client";
 import {
   getHostRuntimeStore,
+  hasConfiguredLocalDaemonOverride,
   useHostMutations,
   useHostRuntimeClient,
   useHosts,
 } from "@/runtime/host-runtime";
 import { getDaemonStartService } from "@/runtime/daemon-start-service";
-import {
-  addBrowserActiveWorkspaceLocationListener,
-  syncNavigationActiveWorkspace,
-} from "@/stores/navigation-active-workspace-store";
 import { usePanelStore } from "@/stores/panel-store";
-import { useSessionStore } from "@/stores/session-store";
 import { THEME_TO_UNISTYLES, type ThemeName } from "@/styles/theme";
 import type { HostProfile } from "@/types/host-connection";
 import { resolveActiveHost } from "@/utils/active-host";
@@ -94,13 +83,12 @@ import {
   parseWorkspaceOpenIntent,
 } from "@/utils/host-routes";
 import { buildNotificationRoute, resolveNotificationTarget } from "@/utils/notification-routing";
+import { navigateToAgent } from "@/utils/navigate-to-agent";
 import {
   ensureOsNotificationPermission,
   WEB_NOTIFICATION_CLICK_EVENT,
   type WebNotificationClickDetail,
 } from "@/utils/os-notifications";
-import { resolveWorkspaceIdByExecutionDirectory } from "@/utils/workspace-execution";
-import { prepareWorkspaceTab } from "@/utils/workspace-navigation";
 
 polyfillCrypto();
 
@@ -127,25 +115,8 @@ function PushNotificationRouter() {
     const serverId = target.serverId;
     const agentId = target.agentId;
     if (serverId && agentId) {
-      const session = useSessionStore.getState().sessions[serverId];
-      const agent = session?.agents.get(agentId);
-      const workspaceId =
-        target.workspaceId ??
-        resolveWorkspaceIdByExecutionDirectory({
-          workspaces: session?.workspaces.values(),
-          workspaceDirectory: agent?.cwd,
-        });
-
-      if (workspaceId) {
-        prepareWorkspaceTab({
-          serverId,
-          workspaceId,
-          target: { kind: "agent", agentId },
-          pin: true,
-        });
-        navigateToWorkspace(serverId, workspaceId, { currentPathname: pathname });
-        return;
-      }
+      navigateToAgent({ serverId, agentId, currentPathname: pathname, pin: true });
+      return;
     }
 
     router.navigate(buildNotificationRoute(data));
@@ -336,6 +307,8 @@ function HostRuntimeBootstrapProvider({ children }: { children: ReactNode }) {
   const anyOnlineHostServerId = useEarliestOnlineHostServerId();
   const daemonStartError = useDaemonStartLastError();
   const daemonStartIsRunning = useDaemonStartIsRunning();
+  const waitForConfiguredLocalDaemon =
+    hasConfiguredLocalDaemonOverride() && !shouldUseDesktopDaemon();
 
   const [hasGivenUpWaitingForHost, setHasGivenUpWaitingForHost] = useState(false);
   useEffect(() => {
@@ -343,6 +316,7 @@ function HostRuntimeBootstrapProvider({ children }: { children: ReactNode }) {
       anyOnlineHostServerId ||
       daemonStartError ||
       daemonStartIsRunning ||
+      waitForConfiguredLocalDaemon ||
       hasGivenUpWaitingForHost
     ) {
       return;
@@ -353,7 +327,13 @@ function HostRuntimeBootstrapProvider({ children }: { children: ReactNode }) {
     return () => {
       clearTimeout(handle);
     };
-  }, [anyOnlineHostServerId, daemonStartError, daemonStartIsRunning, hasGivenUpWaitingForHost]);
+  }, [
+    anyOnlineHostServerId,
+    daemonStartError,
+    daemonStartIsRunning,
+    waitForConfiguredLocalDaemon,
+    hasGivenUpWaitingForHost,
+  ]);
 
   const retry = useCallback(() => {
     const daemonStartService = getDaemonStartService({ store: getHostRuntimeStore() });
@@ -863,28 +843,6 @@ function RootStack() {
   );
 }
 
-function NavigationActiveWorkspaceObserver() {
-  const navigationRef = useNavigationContainerRef();
-
-  useEffect(() => {
-    syncNavigationActiveWorkspace(navigationRef);
-    const unsubscribeBrowserLocation = addBrowserActiveWorkspaceLocationListener();
-    const unsubscribeState = navigationRef.addListener("state", () => {
-      syncNavigationActiveWorkspace(navigationRef);
-    });
-    const unsubscribeReady = navigationRef.addListener("ready" as never, () => {
-      syncNavigationActiveWorkspace(navigationRef);
-    });
-    return () => {
-      unsubscribeBrowserLocation();
-      unsubscribeState();
-      unsubscribeReady();
-    };
-  }, [navigationRef]);
-
-  return null;
-}
-
 function AppShell() {
   return (
     <SidebarAnimationProvider>
@@ -911,15 +869,20 @@ function RuntimeProviders({ children }: { children: ReactNode }) {
   );
 }
 
+// PortalProvider must remain the innermost global provider here.
+// `@gorhom/portal` renders portaled children at the host's location in the
+// tree, so any context a portaled sheet might consume (QueryClient, theme,
+// auth, settings, …) must wrap PortalProvider — not be wrapped by it.
+// Adding a new global provider? Put it above PortalProvider.
 function RootProviders({ children }: { children: ReactNode }) {
   return (
-    <PortalProvider>
+    <QueryProvider>
       <SafeAreaProvider>
         <KeyboardProvider>
-          <QueryProvider>{children}</QueryProvider>
+          <PortalProvider>{children}</PortalProvider>
         </KeyboardProvider>
       </SafeAreaProvider>
-    </PortalProvider>
+    </QueryProvider>
   );
 }
 
@@ -927,7 +890,6 @@ export default function RootLayout() {
   return (
     <GestureHandlerRootView style={flexStyle}>
       <View style={layoutStyles.surfaceFill}>
-        <NavigationActiveWorkspaceObserver />
         <RootProviders>
           <RuntimeProviders>
             <AppShell />

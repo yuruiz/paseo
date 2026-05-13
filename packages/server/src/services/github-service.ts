@@ -91,6 +91,8 @@ const HeadRepositoryOwnerSchema = z
   .nullable()
   .optional();
 
+const PullRequestMergeableSchema = z.enum(["MERGEABLE", "CONFLICTING", "UNKNOWN"]).catch("UNKNOWN");
+
 const CurrentPullRequestStatusSchema = z.object({
   number: z.number().optional(),
   url: z.string().catch(""),
@@ -102,6 +104,7 @@ const CurrentPullRequestStatusSchema = z.object({
   mergedAt: z.string().nullable().optional(),
   statusCheckRollup: z.unknown().optional(),
   reviewDecision: z.unknown().optional(),
+  mergeable: PullRequestMergeableSchema.optional().default("UNKNOWN"),
   headRepositoryOwner: HeadRepositoryOwnerSchema,
 });
 
@@ -233,8 +236,9 @@ query PullRequestCheckoutTarget($owner: String!, $name: String!, $number: Int!) 
   }
 }`;
 
-const CURRENT_PR_STATUS_FIELDS =
-  "number,url,title,state,isDraft,baseRefName,headRefName,mergedAt,statusCheckRollup,reviewDecision,headRepositoryOwner";
+const CURRENT_PR_STATUS_BASE_FIELDS =
+  "number,url,title,state,isDraft,baseRefName,headRefName,mergedAt,reviewDecision,mergeable,headRepositoryOwner";
+const CURRENT_PR_STATUS_FIELDS = `${CURRENT_PR_STATUS_BASE_FIELDS},statusCheckRollup`;
 
 const PULL_REQUEST_TIMELINE_QUERY = `
 query PullRequestTimeline($owner: String!, $name: String!, $number: Int!) {
@@ -290,6 +294,7 @@ interface GitHubServiceDependencies {
 
 export interface GitHubCommandRunnerOptions {
   cwd: string;
+  envOverlay?: Record<string, string>;
 }
 
 export interface GitHubCommandResult {
@@ -346,6 +351,7 @@ export interface PullRequestCheck {
 
 export type PullRequestChecksStatus = "none" | "pending" | "success" | "failure";
 export type PullRequestReviewDecision = "approved" | "changes_requested" | "pending" | null;
+export type PullRequestMergeable = "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
 
 export interface GitHubCurrentPullRequestStatus {
   number?: number;
@@ -358,6 +364,7 @@ export interface GitHubCurrentPullRequestStatus {
   headRefName: string;
   isMerged: boolean;
   isDraft?: boolean;
+  mergeable: PullRequestMergeable;
   checks: PullRequestCheck[];
   checksStatus: PullRequestChecksStatus;
   reviewDecision: PullRequestReviewDecision;
@@ -402,6 +409,18 @@ export interface GitHubPullRequestTimeline {
 export interface GitHubPullRequestCreateResult {
   url: string;
   number: number;
+}
+
+export type GitHubPullRequestMergeMethod = "merge" | "squash" | "rebase";
+
+export interface MergeGitHubPullRequestOptions {
+  cwd: string;
+  prNumber: number;
+  mergeMethod: GitHubPullRequestMergeMethod;
+}
+
+export interface GitHubPullRequestMergeResult {
+  success: true;
 }
 
 export type GitHubReadOptions =
@@ -492,6 +511,7 @@ export interface GitHubService {
   createPullRequest(
     options: CreateGitHubPullRequestOptions,
   ): Promise<GitHubPullRequestCreateResult>;
+  mergePullRequest(options: MergeGitHubPullRequestOptions): Promise<GitHubPullRequestMergeResult>;
   isAuthenticated(options: { cwd: string } & GitHubReadOptions): Promise<boolean>;
   retainCurrentPullRequestStatusPoll?(options: {
     cwd: string;
@@ -933,11 +953,12 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
       const readOptions: GitHubReadOptions = input.force
         ? { force: true, reason: input.reason }
         : { force: false, reason: input.reason };
+      const query = normalizeGitHubSearchQuery(input.query);
       const [issuesResult, prsResult] = await Promise.allSettled([
         shouldFetchIssues
           ? this.listIssues({
               cwd: input.cwd,
-              query: input.query,
+              query,
               limit: input.limit,
               ...readOptions,
             })
@@ -945,7 +966,7 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
         shouldFetchPullRequests
           ? this.listPullRequests({
               cwd: input.cwd,
-              query: input.query,
+              query,
               limit: input.limit,
               ...readOptions,
             })
@@ -1027,6 +1048,14 @@ export function createGitHubService(options: CreateGitHubServiceOptions = {}): G
         })
         .parse(JSON.parse(stdout || "{}"));
       return parsed;
+    },
+
+    async mergePullRequest(input) {
+      await run(["pr", "merge", String(input.prNumber), `--${input.mergeMethod}`], {
+        cwd: input.cwd,
+        envOverlay: { GH_PROMPT_DISABLED: "1" },
+      });
+      return { success: true };
     },
 
     isAuthenticated(input) {
@@ -1166,9 +1195,18 @@ async function runGhCommand(
 ): Promise<GitHubCommandResult> {
   return execCommand("gh", args, {
     cwd: options.cwd,
-    envOverlay: GITHUB_ENV,
+    envOverlay: { ...GITHUB_ENV, ...options.envOverlay },
     maxBuffer: 10 * 1024 * 1024,
   });
+}
+
+const GITHUB_ISSUE_OR_PR_URL_PATTERN =
+  /^https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/(?:pull|issues)\/(\d+)(?:[/?#].*)?$/i;
+
+function normalizeGitHubSearchQuery(query: string): string {
+  const trimmed = query.trim();
+  const match = trimmed.match(GITHUB_ISSUE_OR_PR_URL_PATTERN);
+  return match ? match[1] : query;
 }
 
 function buildCacheKey(params: { cwd: string; method: string; args: unknown }): string {
@@ -1277,6 +1315,13 @@ function isNoPullRequestFoundError(error: unknown): boolean {
   return text.includes("no pull requests found");
 }
 
+function isStatusCheckRollupPermissionError(error: unknown): boolean {
+  if (!(error instanceof GitHubCommandError)) {
+    return false;
+  }
+  return error.stderr.toLowerCase().includes("statuscheckrollup");
+}
+
 async function resolveCurrentPullRequestView(options: {
   cwd: string;
   headRef: string;
@@ -1333,8 +1378,10 @@ async function tryCurrentPullRequestView(options: {
   run: (args: string[], options: GitHubCommandRunnerOptions) => Promise<string>;
 }): Promise<ResolvedPullRequestCandidate | null> {
   try {
-    const stdout = await options.run(["pr", "view", "--json", CURRENT_PR_STATUS_FIELDS], {
+    const stdout = await runCurrentPullRequestStatusCommand({
       cwd: options.cwd,
+      run: options.run,
+      args: ["pr", "view"],
     });
     return parseCurrentPullRequestCandidate(stdout, options.headRef);
   } catch (error) {
@@ -1355,24 +1402,38 @@ async function listCurrentPullRequestCandidates(options: {
   if (options.repo) {
     args.push("--repo", options.repo);
   }
-  args.push(
-    "--state",
-    "all",
-    "--head",
-    options.headRef,
-    "--json",
-    CURRENT_PR_STATUS_FIELDS,
-    "--limit",
-    "10",
-  );
+  args.push("--state", "all", "--head", options.headRef, "--limit", "10");
   try {
-    const stdout = await options.run(args, { cwd: options.cwd });
+    const stdout = await runCurrentPullRequestStatusCommand({
+      cwd: options.cwd,
+      run: options.run,
+      args,
+    });
     return parseCurrentPullRequestCandidateList(stdout, options.headRef);
   } catch (error) {
     if (isNoPullRequestFoundError(error)) {
       return [];
     }
     throw error;
+  }
+}
+
+async function runCurrentPullRequestStatusCommand(options: {
+  cwd: string;
+  run: (args: string[], options: GitHubCommandRunnerOptions) => Promise<string>;
+  args: string[];
+}): Promise<string> {
+  try {
+    return await options.run([...options.args, "--json", CURRENT_PR_STATUS_FIELDS], {
+      cwd: options.cwd,
+    });
+  } catch (error) {
+    if (!isStatusCheckRollupPermissionError(error)) {
+      throw error;
+    }
+    return options.run([...options.args, "--json", CURRENT_PR_STATUS_BASE_FIELDS], {
+      cwd: options.cwd,
+    });
   }
 }
 
@@ -1680,6 +1741,7 @@ function toCurrentPullRequestStatus(
     headRefName: item.headRefName || fallbackHeadRefName,
     isMerged: mergedAt !== null,
     isDraft: item.isDraft ?? false,
+    mergeable: item.mergeable,
     checks,
     checksStatus: computeChecksStatus(checks),
     reviewDecision: mapReviewDecision(item.reviewDecision),

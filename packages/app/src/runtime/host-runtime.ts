@@ -9,7 +9,6 @@ import {
 } from "@server/client/daemon-client";
 import {
   connectionFromListen,
-  hostHasConnection,
   normalizeStoredHostProfile,
   upsertHostConnectionInProfiles,
   registryHasConnection,
@@ -120,7 +119,11 @@ export interface HostRuntimeControllerDeps {
     clientId: string;
     runtimeGeneration: number;
   }) => DaemonClient;
-  connectToDaemon: (input: { host: HostProfile; connection: HostConnection }) => Promise<{
+  connectToDaemon: (input: {
+    host: HostProfile;
+    connection: HostConnection;
+    timeoutMs?: number;
+  }) => Promise<{
     client: DaemonClient;
     serverId: string;
     hostname: string | null;
@@ -142,6 +145,7 @@ const PROBE_MAX_BACKOFF_MS = 30_000;
 const ADAPTIVE_SWITCH_THRESHOLD_MS = 40;
 const ADAPTIVE_SWITCH_CONSECUTIVE_PROBES = 3;
 const DEFAULT_AGENT_DIRECTORY_PAGE_LIMIT = 200;
+const CONFIGURED_OVERRIDE_BOOTSTRAP_RETRY_MS = 1_000;
 
 const DEFAULT_AGENT_DIRECTORY_SORT: NonNullable<FetchAgentsOptions["sort"]> = [
   { key: "updated_at", direction: "desc" },
@@ -476,7 +480,7 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
         ...base,
         url: buildRelayWebSocketUrl({
           endpoint: connection.relayEndpoint,
-          useTls: shouldUseTlsForDefaultHostedRelay(connection.relayEndpoint),
+          useTls: connection.useTls ?? shouldUseTlsForDefaultHostedRelay(connection.relayEndpoint),
           serverId: host.serverId,
         }),
         e2ee: {
@@ -485,8 +489,11 @@ function createDefaultDeps(): HostRuntimeControllerDeps {
         },
       });
     },
-    connectToDaemon: ({ host, connection }) =>
-      connectToDaemon(connection, { serverId: host.serverId }),
+    connectToDaemon: ({ host, connection, timeoutMs }) =>
+      connectToDaemon(connection, {
+        ...(host.serverId ? { serverId: host.serverId } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      }),
     getClientId: () => getOrCreateClientId(),
   };
 }
@@ -595,8 +602,20 @@ export class HostRuntimeController {
   }
 
   async updateHost(host: HostProfile): Promise<void> {
+    const activeConnectionId = this.snapshot.activeConnectionId;
+    const previousActiveConnection = findConnectionById(this.host, activeConnectionId);
     this.host = host;
     this.trackConnectionFirstSeen();
+    const nextActiveConnection = findConnectionById(this.host, activeConnectionId);
+    if (
+      activeConnectionId &&
+      previousActiveConnection &&
+      nextActiveConnection &&
+      !equal(previousActiveConnection, nextActiveConnection)
+    ) {
+      this.connectionLastProbedAt.delete(activeConnectionId);
+      await this.switchToConnection({ connectionId: activeConnectionId });
+    }
     await this.runProbeCycleNow();
   }
 
@@ -1179,12 +1198,16 @@ function readConfiguredLocalDaemonOverride(): string | null {
   return value && value.length > 0 ? value : null;
 }
 
-function placeholderServerIdForEndpoint(endpoint: string): string {
-  return `local:${normalizeHostPort(endpoint)}`;
+export function hasConfiguredLocalDaemonOverride(): boolean {
+  return readConfiguredLocalDaemonOverride() !== null;
 }
 
 function isPlaceholderServerId(serverId: string): boolean {
   return serverId.startsWith("local:");
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function rekeyMap<V>(map: Map<string, V>, oldKey: string, newKey: string): void {
@@ -1212,6 +1235,7 @@ export class HostRuntimeStore {
   private lastConnectionStatusByServer = new Map<string, HostRuntimeConnectionStatus>();
   private offlineSinceByServer = new Map<string, number>();
   private agentDirectoryBootstrapInFlight = new Map<string, Promise<void>>();
+  private configuredOverrideBootstrapInFlight: Promise<void> | null = null;
   private bootStarted = false;
 
   constructor(input?: { deps?: HostRuntimeControllerDeps }) {
@@ -1244,12 +1268,8 @@ export class HostRuntimeStore {
   }
 
   private async runBoot(): Promise<void> {
-    await this.loadFromStorage();
-
     const override = readConfiguredLocalDaemonOverride();
-    if (override) {
-      this.prunePlaceholderHostsForOtherEndpoints(override);
-    }
+    await this.loadFromStorage();
 
     let isE2E: string | null = null;
     try {
@@ -1282,12 +1302,16 @@ export class HostRuntimeStore {
       if (!Array.isArray(parsed)) {
         return;
       }
-      const profiles = parsed
+      const normalizedProfiles = parsed
         .map((entry) => normalizeStoredHostProfile(entry))
         .filter((entry): entry is HostProfile => entry !== null);
+      const profiles = normalizedProfiles.filter((entry) => !isPlaceholderServerId(entry.serverId));
       this.hosts = profiles;
       this.syncHosts(profiles);
       this.emitHostList();
+      if (profiles.length !== normalizedProfiles.length) {
+        void this.persistHosts();
+      }
     } catch (error) {
       console.error("[HostRuntime] Failed to load host registry from storage", error);
     }
@@ -1300,15 +1324,9 @@ export class HostRuntimeStore {
     }
 
     try {
-      const { client, serverId, hostname } = await connectToDaemon(connection, {
-        timeoutMs: DEFAULT_LOCALHOST_BOOTSTRAP_TIMEOUT_MS,
-      });
-
-      await this.upsertHostConnection({
-        serverId,
-        label: hostname ?? undefined,
+      await this.probeAndUpsertConnection({
         connection,
-        existingClient: client,
+        timeoutMs: DEFAULT_LOCALHOST_BOOTSTRAP_TIMEOUT_MS,
       });
     } catch (error) {
       console.warn("[HostRuntime] bootstrap probe failed", {
@@ -1323,35 +1341,45 @@ export class HostRuntimeStore {
     if (!connection) {
       return;
     }
-    const placeholderId = placeholderServerIdForEndpoint(endpoint);
-    const staleHosts = this.hosts.filter(
-      (host) => host.serverId !== placeholderId && hostHasConnection(host, connection),
-    );
-    for (const staleHost of staleHosts) {
-      void this.removeConnection(staleHost.serverId, connection.id);
-    }
     if (registryHasConnection(this.hosts, connection)) {
       return;
     }
-    void this.upsertHostConnection({
-      serverId: placeholderId,
-      connection,
-    });
-  }
-
-  private prunePlaceholderHostsForOtherEndpoints(currentEndpoint: string): void {
-    const expectedServerId = placeholderServerIdForEndpoint(currentEndpoint);
-    const remaining = this.hosts.filter((host) => {
-      if (!isPlaceholderServerId(host.serverId)) {
-        return true;
-      }
-      return host.serverId === expectedServerId;
-    });
-    if (remaining.length === this.hosts.length) {
+    if (this.configuredOverrideBootstrapInFlight) {
       return;
     }
-    this.setHostsAndSync(remaining);
-    void this.persistHosts();
+
+    const bootstrap = this.runConfiguredOverrideBootstrap(endpoint, connection).finally(() => {
+      if (this.configuredOverrideBootstrapInFlight === bootstrap) {
+        this.configuredOverrideBootstrapInFlight = null;
+      }
+    });
+    this.configuredOverrideBootstrapInFlight = bootstrap;
+  }
+
+  private async runConfiguredOverrideBootstrap(
+    endpoint: string,
+    connection: HostConnection,
+  ): Promise<void> {
+    let attempt = 0;
+    while (!registryHasConnection(this.hosts, connection)) {
+      attempt += 1;
+      try {
+        await this.probeAndUpsertConnection({
+          connection,
+          timeoutMs: DEFAULT_LOCALHOST_BOOTSTRAP_TIMEOUT_MS,
+        });
+        return;
+      } catch (error) {
+        if (attempt === 1 || attempt % 10 === 0) {
+          console.warn("[HostRuntime] configured bootstrap probe failed", {
+            endpoint,
+            attempt,
+            error,
+          });
+        }
+        await delay(CONFIGURED_OVERRIDE_BOOTSTRAP_RETRY_MS);
+      }
+    }
   }
 
   reconcileServerId(oldServerId: string, newServerId: string): void {
@@ -1417,33 +1445,91 @@ export class HostRuntimeStore {
     });
   }
 
+  async probeAndUpsertConnection(input: {
+    connection: HostConnection;
+    label?: string;
+    timeoutMs?: number;
+  }): Promise<{ profile: HostProfile; serverId: string; hostname: string | null }> {
+    if (input.connection.type === "relay") {
+      throw new Error("Cannot probe a relay connection without a server id.");
+    }
+    const probeHost: HostProfile = {
+      serverId: "",
+      label: input.label ?? input.connection.id,
+      lifecycle: {},
+      connections: [input.connection],
+      preferredConnectionId: input.connection.id,
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    const { client, serverId, hostname } = await this.deps.connectToDaemon({
+      host: probeHost,
+      connection: input.connection,
+      ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+    });
+    const profile = await this.upsertHostConnection({
+      serverId,
+      label: input.label ?? hostname ?? undefined,
+      connection: input.connection,
+      existingClient: client,
+    });
+    return { profile, serverId, hostname };
+  }
+
+  async probeAndUpsertDirectConnection(input: {
+    endpoint: string;
+    useTls?: boolean;
+    password?: string;
+    label?: string;
+  }): Promise<{ profile: HostProfile; serverId: string; hostname: string | null }> {
+    const endpoint = normalizeHostPort(input.endpoint);
+    const password = input.password?.trim();
+    return this.probeAndUpsertConnection({
+      label: input.label,
+      connection: {
+        id: `direct:${endpoint}`,
+        type: "directTcp",
+        endpoint,
+        useTls: input.useTls ?? false,
+        ...(password ? { password } : {}),
+      },
+    });
+  }
+
   async upsertRelayConnection(input: {
     serverId: string;
     relayEndpoint: string;
+    useTls?: boolean;
     daemonPublicKeyB64: string;
     label?: string;
   }): Promise<HostProfile> {
     const relayEndpoint = normalizeHostPort(input.relayEndpoint);
+    const useTls = input.useTls ?? false;
     const daemonPublicKeyB64 = input.daemonPublicKeyB64.trim();
     if (!daemonPublicKeyB64) {
       throw new Error("daemonPublicKeyB64 is required");
     }
+    const explicitUseTls = input.useTls !== undefined;
     return this.upsertHostConnection({
       serverId: input.serverId,
       label: input.label,
       connection: {
-        id: `relay:${relayEndpoint}`,
+        id: useTls ? `relay:wss:${relayEndpoint}` : `relay:${relayEndpoint}`,
         type: "relay",
         relayEndpoint,
+        ...(explicitUseTls ? { useTls } : {}),
         daemonPublicKeyB64,
       },
     });
   }
 
   async upsertConnectionFromOffer(offer: ConnectionOffer, label?: string): Promise<HostProfile> {
+    // COMPAT(oldRelayOfferTls): added in v0.1.73, remove after 2026-11-10.
+    const useTls = offer.relay.useTls ?? shouldUseTlsForDefaultHostedRelay(offer.relay.endpoint);
     return this.upsertRelayConnection({
       serverId: offer.serverId,
       relayEndpoint: offer.relay.endpoint,
+      useTls,
       daemonPublicKeyB64: offer.daemonPublicKeyB64,
       label,
     });
@@ -2001,9 +2087,16 @@ export interface HostMutations {
     password?: string;
     label?: string;
   }) => Promise<HostProfile>;
+  probeAndUpsertDirectConnection: (input: {
+    endpoint: string;
+    useTls?: boolean;
+    password?: string;
+    label?: string;
+  }) => Promise<{ profile: HostProfile; serverId: string; hostname: string | null }>;
   upsertRelayConnection: (input: {
     serverId: string;
     relayEndpoint: string;
+    useTls?: boolean;
     daemonPublicKeyB64: string;
     label?: string;
   }) => Promise<HostProfile>;
@@ -2022,6 +2115,7 @@ export function useHostMutations(): HostMutations {
   return useMemo(
     () => ({
       upsertDirectConnection: (input) => store.upsertDirectConnection(input),
+      probeAndUpsertDirectConnection: (input) => store.probeAndUpsertDirectConnection(input),
       upsertRelayConnection: (input) => store.upsertRelayConnection(input),
       upsertConnectionFromOffer: (offer, label) => store.upsertConnectionFromOffer(offer, label),
       upsertConnectionFromOfferUrl: (url, label) => store.upsertConnectionFromOfferUrl(url, label),

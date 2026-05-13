@@ -47,6 +47,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useWebElementScrollbar } from "@/components/use-web-scrollbar";
 import { useShortcutKeys } from "@/hooks/use-shortcut-keys";
+import { useIosHardwareKeyboardSubmit } from "@/hooks/use-ios-hardware-keyboard-submit";
 import { formatShortcut } from "@/utils/format-shortcut";
 import { getShortcutOs } from "@/utils/shortcut-platform";
 import type { MessageInputKeyboardActionKind } from "@/keyboard/actions";
@@ -125,6 +126,8 @@ export interface MessageInputProps {
   onHeightChange?: (height: number) => void;
   /** Extra styles merged onto the input wrapper (e.g. elevated background). */
   inputWrapperStyle?: import("react-native").ViewStyle;
+  /** Content rendered inside the bordered input surface, above the text input (e.g. attachment pills). */
+  attachmentSlot?: React.ReactNode;
 }
 
 export interface MessageInputRef {
@@ -1094,6 +1097,7 @@ interface ResolvedMessageInputProps {
   onFocusChange: ((focused: boolean) => void) | undefined;
   onHeightChange: ((height: number) => void) | undefined;
   inputWrapperStyle: import("react-native").ViewStyle | undefined;
+  attachmentSlot: React.ReactNode;
 }
 
 function resolveMessageInputProps(props: MessageInputProps): ResolvedMessageInputProps {
@@ -1133,6 +1137,7 @@ function resolveMessageInputProps(props: MessageInputProps): ResolvedMessageInpu
     onFocusChange: props.onFocusChange,
     onHeightChange: props.onHeightChange,
     inputWrapperStyle: props.inputWrapperStyle,
+    attachmentSlot: props.attachmentSlot,
   };
 }
 
@@ -1180,6 +1185,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       onFocusChange,
       onHeightChange,
       inputWrapperStyle,
+      attachmentSlot,
     } = resolveMessageInputProps(props);
     const buttonIconSize = isWeb ? ICON_SIZE.md : ICON_SIZE.lg;
     const toast = useToast();
@@ -1593,6 +1599,10 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         defaultSendBehavior,
         isAgentRunning,
       });
+    useIosHardwareKeyboardSubmit({
+      isEnabled: isInputFocused && !isSendButtonDisabled,
+      onSubmit: handleDefaultSendAction,
+    });
     const submitAccessibilityLabel = resolveSubmitAccessibilityLabel({
       submitButtonAccessibilityLabel,
       canPressLoadingButton,
@@ -1697,6 +1707,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       <View ref={rootRef} style={styles.container} testID="message-input-root">
         {/* Regular input */}
         <Animated.View ref={inputWrapperRef} style={inputWrapperCombinedStyle}>
+          {attachmentSlot}
           {/* Text input */}
           <View style={styles.textInputScrollWrapper}>
             <ThemedTextInput

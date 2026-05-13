@@ -9,6 +9,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, GitBranch, GitPullRequest } from "lucide-react-native";
 import { Composer } from "@/components/composer";
 import { splitComposerAttachmentsForSubmit } from "@/components/composer-attachments";
+import { FileDropZone } from "@/components/file-drop-zone";
 import { Combobox, ComboboxItem } from "@/components/ui/combobox";
 import type { ComboboxOption as ComboboxOptionType } from "@/components/ui/combobox";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -29,9 +30,31 @@ import { navigateToPreparedWorkspaceTab } from "@/utils/workspace-navigation";
 import type { ComposerAttachment, UserComposerAttachment } from "@/attachments/types";
 import type { ImageAttachment, MessagePayload } from "@/components/message-input";
 import type { AgentAttachment, GitHubSearchItem } from "@server/shared/messages";
+import type { CreatePaseoWorktreeInput } from "@server/client/daemon-client";
 import type { AgentProvider } from "@server/server/agent/agent-sdk-types";
-import { pickerItemToCheckoutRequest, type PickerItem } from "./new-workspace-picker-item";
-import { syncPickerPrAttachment } from "./new-workspace-picker-state";
+import { isEmptyWorkspaceSubmission, runCreateEmptyWorkspace } from "./new-workspace-empty";
+import {
+  pickerItemToCheckoutRequest,
+  type PickerCheckoutRequest,
+  type PickerItem,
+} from "./new-workspace-picker-item";
+import {
+  deriveAutoPickerItemFromAttachments,
+  syncPickerPrAttachment,
+} from "./new-workspace-picker-state";
+
+function resolveCheckoutRequest(
+  selectedItem: PickerItem | null,
+  currentBranch: string | null,
+): PickerCheckoutRequest | undefined {
+  const selectedCheckoutRequest = pickerItemToCheckoutRequest(selectedItem);
+  if (selectedCheckoutRequest) return selectedCheckoutRequest;
+  if (!currentBranch) return undefined;
+  return {
+    action: "branch-off",
+    refName: currentBranch,
+  };
+}
 
 interface NewWorkspaceScreenProps {
   serverId: string;
@@ -47,6 +70,17 @@ interface PickerOptionData {
 interface PickerSelection {
   item: PickerItem;
   attachedPrNumber: number | null;
+}
+
+// Manual picks always win; the auto-promoted item is a fallback so the user
+// doesn't silently get "main" when they meant the PR they just attached.
+function combinePickerSelection(
+  manual: PickerSelection | null,
+  autoItem: PickerItem | null,
+): PickerSelection | null {
+  if (manual) return manual;
+  if (autoItem) return { item: autoItem, attachedPrNumber: null };
+  return null;
 }
 
 const BRANCH_OPTION_PREFIX = "branch:";
@@ -352,7 +386,6 @@ function submitWorkspaceDraft(input: SubmitDraftInput): void {
       attachments: attachments.filter(
         (attachment): attachment is UserComposerAttachment => attachment.kind !== "review",
       ),
-      cwd: workspaceDirectory,
     },
   });
   useWorkspaceDraftSubmissionStore.getState().setPending({
@@ -377,7 +410,6 @@ function submitWorkspaceDraft(input: SubmitDraftInput): void {
     serverId,
     workspaceId,
     target: { kind: "draft", draftId },
-    navigationMethod: "replace",
   });
   useDraftStore.getState().clearDraftInput({ draftKey, lifecycle: "sent" });
 }
@@ -399,8 +431,8 @@ export function NewWorkspaceScreen({
   const [createdWorkspace, setCreatedWorkspace] = useState<ReturnType<
     typeof normalizeWorkspaceDescriptor
   > | null>(null);
-  const [pendingAction, setPendingAction] = useState<"chat" | null>(null);
-  const [pickerSelection, setPickerSelection] = useState<PickerSelection | null>(null);
+  const [pendingAction, setPendingAction] = useState<"chat" | "empty" | null>(null);
+  const [manualPickerSelection, setManualPickerSelection] = useState<PickerSelection | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerSearchQuery, setPickerSearchQuery] = useState("");
   const [debouncedPickerSearchQuery, setDebouncedPickerSearchQuery] = useState("");
@@ -414,14 +446,12 @@ export function NewWorkspaceScreen({
 
   const displayName = displayNameProp?.trim() ?? "";
   const workspace = createdWorkspace;
-  const selectedItem = pickerSelection?.item ?? null;
   const isPending = pendingAction !== null;
   const client = useHostRuntimeClient(serverId);
   const isConnected = useHostRuntimeIsConnected(serverId);
   const draftKey = `new-workspace:${serverId}:${sourceDirectory}`;
   const chatDraft = useAgentInputDraft({
     draftKey,
-    initialCwd: sourceDirectory,
     composer: buildComposerConfig({
       serverId,
       isConnected,
@@ -430,6 +460,13 @@ export function NewWorkspaceScreen({
     }),
   });
   const composerState = chatDraft.composerState;
+
+  const autoPickerItem = useMemo(
+    () => deriveAutoPickerItemFromAttachments(chatDraft.attachments),
+    [chatDraft.attachments],
+  );
+  const pickerSelection = combinePickerSelection(manualPickerSelection, autoPickerItem);
+  const selectedItem = pickerSelection?.item ?? null;
 
   const withConnectedClient = useCallback(() => {
     if (!client || !isConnected) {
@@ -526,7 +563,7 @@ export function NewWorkspaceScreen({
         item,
       });
 
-      setPickerSelection({
+      setManualPickerSelection({
         item,
         attachedPrNumber: next.attachedPrNumber,
       });
@@ -564,8 +601,12 @@ export function NewWorkspaceScreen({
   }, []);
 
   const buildCreateWorktreeInput = useCallback(
-    (input: { cwd: string; prompt: string; attachments: AgentAttachment[] }) => {
-      const checkoutRequest = pickerItemToCheckoutRequest(selectedItem);
+    (input: {
+      cwd: string;
+      prompt: string;
+      attachments: AgentAttachment[];
+    }): CreatePaseoWorktreeInput => {
+      const checkoutRequest = resolveCheckoutRequest(selectedItem, currentBranch);
       const trimmedPrompt = input.prompt.trim();
       const hasFirstAgentContext = trimmedPrompt.length > 0 || input.attachments.length > 0;
 
@@ -583,7 +624,7 @@ export function NewWorkspaceScreen({
         ...checkoutRequest,
       };
     },
-    [selectedItem],
+    [currentBranch, selectedItem],
   );
 
   const ensureWorkspace = useCallback(
@@ -603,11 +644,21 @@ export function NewWorkspaceScreen({
     [buildCreateWorktreeInput, createdWorkspace, mergeWorkspaces, serverId, withConnectedClient],
   );
 
-  const handleCreateChatAgent = useCallback(
+  const handleSubmitNewWorkspace = useCallback(
     async (payload: MessagePayload) => {
       try {
-        setPendingAction("chat");
         setErrorMessage(null);
+        if (isEmptyWorkspaceSubmission(payload)) {
+          setPendingAction("empty");
+          await runCreateEmptyWorkspace({
+            payload,
+            ensureWorkspace,
+            serverId,
+          });
+          return;
+        }
+
+        setPendingAction("chat");
         await runCreateChatAgent({
           payload,
           composerState,
@@ -630,6 +681,9 @@ export function NewWorkspaceScreen({
   const addImagesRef = useRef<((images: ImageAttachment[]) => void) | null>(null);
   const handleAddImagesCallback = useCallback((addImages: (images: ImageAttachment[]) => void) => {
     addImagesRef.current = addImages;
+  }, []);
+  const handleFilesDropped = useCallback((files: ImageAttachment[]) => {
+    addImagesRef.current?.(files);
   }, []);
 
   const renderPickerOption = useCallback(
@@ -705,82 +759,84 @@ export function NewWorkspaceScreen({
       : "No matching refs.";
 
   return (
-    <View style={styles.container}>
-      <ScreenHeader
-        left={
-          <>
-            <SidebarMenuToggle />
-            <View style={styles.headerTitleContainer}>
-              <Text style={styles.headerTitle} numberOfLines={1}>
-                New workspace
-              </Text>
-              <Text style={styles.headerProjectTitle} numberOfLines={1}>
-                {workspaceTitle}
-              </Text>
-            </View>
-          </>
-        }
-        leftStyle={styles.headerLeft}
-        borderless
-      />
-      <View style={contentStyle}>
-        <TitlebarDragRegion />
-        <View style={styles.centered}>
-          <Composer
-            agentId={`new-workspace:${serverId}:${sourceDirectory}`}
-            serverId={serverId}
-            isPaneFocused={true}
-            onSubmitMessage={handleCreateChatAgent}
-            allowEmptySubmit={true}
-            submitButtonAccessibilityLabel="Create"
-            submitIcon="return"
-            isSubmitLoading={pendingAction === "chat"}
-            submitBehavior="preserve-and-lock"
-            blurOnSubmit={true}
-            value={chatDraft.text}
-            onChangeText={chatDraft.setText}
-            attachments={chatDraft.attachments}
-            onChangeAttachments={chatDraft.setAttachments}
-            cwd={chatDraft.cwd}
-            clearDraft={handleClearDraft}
-            autoFocus
-            commandDraftConfig={composerState?.commandDraftConfig}
-            statusControls={statusControlsWithDisabled}
-            onAddImages={handleAddImagesCallback}
-          />
-          <Animated.View testID="new-workspace-ref-picker-row" style={optionsRowStyle}>
-            <View>
-              <RefPickerTrigger
-                pickerAnchorRef={pickerAnchorRef}
-                onPress={openPicker}
-                disabled={isPending}
-                badgePressableStyle={badgePressableStyle}
-                selectedItem={selectedItem}
-                triggerLabel={triggerLabel}
-                iconColor={theme.colors.foregroundMuted}
-                iconSize={theme.iconSize.sm}
-              />
-              <Combobox
-                options={options}
-                value={selectedOptionId}
-                onSelect={handleSelectOption}
-                searchable
-                searchPlaceholder="Search branches and PRs"
-                title="Start from"
-                open={pickerOpen}
-                onOpenChange={handlePickerOpenChange}
-                onSearchQueryChange={setPickerSearchQuery}
-                desktopPlacement="bottom-start"
-                anchorRef={pickerAnchorRef}
-                emptyText={pickerEmptyText}
-                renderOption={renderPickerOption}
-              />
-            </View>
-          </Animated.View>
-          {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+    <FileDropZone onFilesDropped={handleFilesDropped}>
+      <View style={styles.container}>
+        <ScreenHeader
+          left={
+            <>
+              <SidebarMenuToggle />
+              <View style={styles.headerTitleContainer}>
+                <Text style={styles.headerTitle} numberOfLines={1}>
+                  New workspace
+                </Text>
+                <Text style={styles.headerProjectTitle} numberOfLines={1}>
+                  {workspaceTitle}
+                </Text>
+              </View>
+            </>
+          }
+          leftStyle={styles.headerLeft}
+          borderless
+        />
+        <View style={contentStyle}>
+          <TitlebarDragRegion />
+          <View style={styles.centered}>
+            <Composer
+              agentId={`new-workspace:${serverId}:${sourceDirectory}`}
+              serverId={serverId}
+              isPaneFocused={true}
+              onSubmitMessage={handleSubmitNewWorkspace}
+              allowEmptySubmit={true}
+              submitButtonAccessibilityLabel="Create"
+              submitIcon="return"
+              isSubmitLoading={pendingAction !== null}
+              submitBehavior="preserve-and-lock"
+              blurOnSubmit={true}
+              value={chatDraft.text}
+              onChangeText={chatDraft.setText}
+              attachments={chatDraft.attachments}
+              onChangeAttachments={chatDraft.setAttachments}
+              cwd={sourceDirectory}
+              clearDraft={handleClearDraft}
+              autoFocus
+              commandDraftConfig={composerState?.commandDraftConfig}
+              statusControls={statusControlsWithDisabled}
+              onAddImages={handleAddImagesCallback}
+            />
+            <Animated.View testID="new-workspace-ref-picker-row" style={optionsRowStyle}>
+              <View>
+                <RefPickerTrigger
+                  pickerAnchorRef={pickerAnchorRef}
+                  onPress={openPicker}
+                  disabled={isPending}
+                  badgePressableStyle={badgePressableStyle}
+                  selectedItem={selectedItem}
+                  triggerLabel={triggerLabel}
+                  iconColor={theme.colors.foregroundMuted}
+                  iconSize={theme.iconSize.sm}
+                />
+                <Combobox
+                  options={options}
+                  value={selectedOptionId}
+                  onSelect={handleSelectOption}
+                  searchable
+                  searchPlaceholder="Search branches and PRs"
+                  title="Start from"
+                  open={pickerOpen}
+                  onOpenChange={handlePickerOpenChange}
+                  onSearchQueryChange={setPickerSearchQuery}
+                  desktopPlacement="bottom-start"
+                  anchorRef={pickerAnchorRef}
+                  emptyText={pickerEmptyText}
+                  renderOption={renderPickerOption}
+                />
+              </View>
+            </Animated.View>
+            {errorMessage ? <Text style={styles.errorText}>{errorMessage}</Text> : null}
+          </View>
         </View>
       </View>
-    </View>
+    </FileDropZone>
   );
 }
 

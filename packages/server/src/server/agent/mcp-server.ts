@@ -8,6 +8,7 @@ import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sd
 import type { AgentProvider } from "./agent-sdk-types.js";
 import type { AgentManager, WaitForAgentResult } from "./agent-manager.js";
 import {
+  AgentFeatureSchema,
   AgentPermissionRequestPayloadSchema,
   AgentListItemPayloadSchema,
   AgentPermissionResponseSchema,
@@ -38,8 +39,8 @@ import { WaitForAgentTracker } from "./wait-for-agent-tracker.js";
 import { scheduleAgentMetadataGeneration } from "./agent-metadata-generator.js";
 import type { VoiceCallerContext, VoiceSpeakHandler } from "../voice-types.js";
 import { expandUserPath, isSameOrDescendantPath, resolvePathFromBase } from "../path-utils.js";
+import { PARENT_AGENT_ID_LABEL } from "../../shared/agent-labels.js";
 import type { TerminalManager } from "../../terminal/terminal-manager.js";
-import { captureTerminalLines } from "../../terminal/terminal-capture.js";
 import type {
   AgentWorktreeSetupContinuation,
   CreatePaseoWorktreeSetupContinuationInput,
@@ -60,13 +61,11 @@ import {
   parseDurationString,
   resolveRequiredProviderModel,
   sanitizePermissionRequest,
-  sendPromptToAgent,
-  setupFinishNotification,
   serializeSnapshotWithMetadata,
-  startAgentRun,
   toScheduleSummary,
   waitForAgentWithTimeout,
 } from "./mcp-shared.js";
+import { sendPromptToAgent, setupFinishNotification, startAgentRun } from "./agent-prompt.js";
 import type { GitHubService } from "../../services/github-service.js";
 import type { WorkspaceGitService } from "../workspace-git-service.js";
 import type { CreatePaseoWorktreeInput } from "../paseo-worktree-service.js";
@@ -81,7 +80,10 @@ export interface AgentMcpServerOptions {
   scheduleService?: ScheduleService | null;
   providerRegistry?: Record<AgentProvider, ProviderDefinition> | null;
   github?: GitHubService;
-  workspaceGitService?: Pick<WorkspaceGitService, "getSnapshot" | "listWorktrees">;
+  workspaceGitService?: Pick<
+    WorkspaceGitService,
+    "getSnapshot" | "listWorktrees" | "resolveRepoRoot"
+  >;
   archiveWorkspaceRecord?: ArchivePaseoWorktreeDependencies["archiveWorkspaceRecord"];
   emitWorkspaceUpdatesForWorkspaceIds?: ArchivePaseoWorktreeDependencies["emitWorkspaceUpdatesForWorkspaceIds"];
   markWorkspaceArchiving?: ArchivePaseoWorktreeDependencies["markWorkspaceArchiving"];
@@ -488,6 +490,10 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       "Required provider/model pair, for example codex/gpt-5.4.",
     ),
     thinking: z.string().optional().describe("Thinking option ID"),
+    features: z
+      .record(z.unknown())
+      .optional()
+      .describe("Provider-specific feature values, for example { fast_mode: true } for Codex."),
     labels: z.record(z.string(), z.string()).optional().describe("Labels to set on the agent"),
     initialPrompt: z
       .string()
@@ -530,6 +536,10 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       "Required provider/model pair, for example codex/gpt-5.4.",
     ),
     thinking: z.string().optional().describe("Thinking option ID"),
+    features: z
+      .record(z.unknown())
+      .optional()
+      .describe("Provider-specific feature values, for example { fast_mode: true } for Codex."),
     labels: z.record(z.string(), z.string()).optional().describe("Labels to set on the agent"),
     initialPrompt: z
       .string()
@@ -578,6 +588,14 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
   const createAgentInputSchema = callerAgentId ? agentToAgentInputSchema : topLevelInputSchema;
   const agentToAgentCreateAgentArgsSchema = z.object(agentToAgentInputSchema).strict();
   const topLevelCreateAgentArgsSchema = z.object(topLevelInputSchema).strict();
+  const listProviderFeaturesInputSchema = {
+    provider: AgentProviderEnum,
+    cwd: z.string().describe("Working directory used to resolve provider feature availability."),
+    modeId: z.string().optional(),
+    model: z.string().optional(),
+    thinkingOptionId: z.string().optional(),
+    featureValues: z.record(z.unknown()).optional(),
+  };
 
   if (options.voiceOnly || options.enableVoiceTools || callerContext?.enableVoiceTools) {
     server.registerTool(
@@ -629,6 +647,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     normalizedTitle: string | null;
     model: string | undefined;
     thinking: string | undefined;
+    features: Record<string, unknown> | undefined;
     labels: Record<string, string> | undefined;
     notifyOnFinish: boolean;
     resolvedCwd: string;
@@ -636,16 +655,31 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     setupContinuation: AgentWorktreeSetupContinuation | undefined;
   }
 
-  const getAvailableModeIds = (provider: AgentProvider): string[] | undefined => {
+  const getProviderModes = (provider: AgentProvider) => {
     const fromRegistry = providerRegistry?.[provider];
     if (fromRegistry) {
-      return fromRegistry.modes.map((mode) => mode.id);
+      return fromRegistry.modes;
     }
     try {
-      return getAgentProviderDefinition(provider).modes.map((mode) => mode.id);
+      return getAgentProviderDefinition(provider).modes;
     } catch {
       return undefined;
     }
+  };
+
+  const getAvailableModeIds = (provider: AgentProvider): string[] | undefined => {
+    return getProviderModes(provider)?.map((mode) => mode.id);
+  };
+
+  const getUnattendedModeId = (provider: AgentProvider): string | undefined => {
+    return getProviderModes(provider)?.find((mode) => mode.isUnattended)?.id;
+  };
+
+  const isParentInUnattendedMode = (provider: AgentProvider, modeId: string | null): boolean => {
+    if (modeId === null) return false;
+    const modes = getProviderModes(provider);
+    if (!modes) return false;
+    return modes.some((mode) => mode.id === modeId && mode.isUnattended === true);
   };
 
   const resolveCallerCreateAgentArgs = (
@@ -668,8 +702,13 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
     const resolvedMode = resolveAndValidateCreateAgentMode({
       requestedMode: callerArgs.mode,
       targetProvider: provider,
-      parent: { provider: parentAgent.provider, modeId: parentAgent.currentModeId },
+      parent: {
+        provider: parentAgent.provider,
+        modeId: parentAgent.currentModeId,
+        isUnattended: isParentInUnattendedMode(parentAgent.provider, parentAgent.currentModeId),
+      },
       availableModes: getAvailableModeIds(provider),
+      targetUnattendedMode: getUnattendedModeId(provider),
     });
     return {
       provider,
@@ -678,6 +717,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       normalizedTitle: callerArgs.title.trim(),
       model: resolvedProviderModel.model,
       thinking: callerArgs.thinking,
+      features: callerArgs.features,
       labels: callerArgs.labels,
       notifyOnFinish: callerArgs.notifyOnFinish ?? false,
       resolvedCwd,
@@ -697,6 +737,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       targetProvider: resolvedProviderModel.provider,
       parent: null,
       availableModes: getAvailableModeIds(resolvedProviderModel.provider),
+      targetUnattendedMode: getUnattendedModeId(resolvedProviderModel.provider),
     });
     let resolvedCwd = expandUserPath(cwd);
     let setupContinuation: AgentWorktreeSetupContinuation | undefined;
@@ -750,6 +791,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       normalizedTitle: topLevelArgs.title.trim(),
       model: resolvedProviderModel.model,
       thinking: topLevelArgs.thinking,
+      features: topLevelArgs.features,
       labels: topLevelArgs.labels,
       notifyOnFinish: topLevelArgs.notifyOnFinish ?? false,
       resolvedCwd,
@@ -793,6 +835,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         normalizedTitle,
         model,
         thinking,
+        features,
         labels,
         notifyOnFinish,
         resolvedCwd,
@@ -802,7 +845,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
 
       const childAgentDefaultLabels = callerContext?.childAgentDefaultLabels;
       const mergedLabels = {
-        ...(callerAgentId ? { "paseo.parent-agent-id": callerAgentId } : {}),
+        ...(callerAgentId ? { [PARENT_AGENT_ID_LABEL]: callerAgentId } : {}),
         ...childAgentDefaultLabels,
         ...labels,
       };
@@ -814,6 +857,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
           title: normalizedTitle ?? undefined,
           model,
           thinkingOptionId: thinking,
+          featureValues: features,
         },
         undefined,
         Object.keys(mergedLabels).length > 0 ? { labels: mergedLabels } : undefined,
@@ -828,6 +872,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         agentManager,
         agentId: snapshot.id,
         cwd: snapshot.cwd,
+        workspaceGitService: options.workspaceGitService,
         initialPrompt: trimmedPrompt,
         explicitTitle: snapshot.config.title,
         paseoHome: options.paseoHome,
@@ -897,6 +942,29 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         }),
       };
       return response;
+    },
+  );
+
+  server.registerTool(
+    "set_agent_feature",
+    {
+      title: "Set agent feature",
+      description: "Set a provider-specific feature on an existing agent, such as Codex fast_mode.",
+      inputSchema: {
+        agentId: z.string(),
+        featureId: z.string().trim().min(1),
+        value: z.unknown(),
+      },
+      outputSchema: {
+        success: z.boolean(),
+      },
+    },
+    async ({ agentId, featureId, value }) => {
+      await agentManager.setAgentFeature(agentId, featureId, value);
+      return {
+        content: [],
+        structuredContent: ensureValidJson({ success: true }),
+      };
     },
   );
 
@@ -1433,12 +1501,11 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         throw new Error("Terminal manager is not configured");
       }
 
-      const terminal = terminalManager.getTerminal(terminalId);
-      if (!terminal) {
+      if (!terminalManager.getTerminal(terminalId)) {
         throw new Error(`Terminal ${terminalId} not found`);
       }
 
-      const capture = captureTerminalLines(terminal, {
+      const capture = await terminalManager.captureTerminal(terminalId, {
         start: scrollback ? 0 : start,
         end,
         stripAnsi,
@@ -1756,6 +1823,37 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
   );
 
   server.registerTool(
+    "list_provider_features",
+    {
+      title: "List provider features",
+      description:
+        "List provider-specific features available for a draft agent configuration, such as Codex fast_mode.",
+      inputSchema: listProviderFeaturesInputSchema,
+      outputSchema: {
+        provider: AgentProviderEnum,
+        features: z.array(AgentFeatureSchema),
+      },
+    },
+    async ({ provider, cwd, modeId, model, thinkingOptionId, featureValues }) => {
+      const features = await agentManager.listDraftFeatures({
+        provider,
+        cwd: expandUserPath(cwd),
+        ...(modeId ? { modeId } : {}),
+        ...(model ? { model } : {}),
+        ...(thinkingOptionId ? { thinkingOptionId } : {}),
+        ...(featureValues ? { featureValues } : {}),
+      });
+      return {
+        content: [],
+        structuredContent: ensureValidJson({
+          provider,
+          features,
+        }),
+      };
+    },
+  );
+
+  server.registerTool(
     "list_worktrees",
     {
       title: "List worktrees",
@@ -1836,6 +1934,10 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
         resolveDefaultBranch: mcpInput.resolveDefaultBranch,
       });
       const { worktree } = createdWorktree;
+      await options.workspaceGitService?.listWorktrees?.(repoRoot, {
+        force: true,
+        reason: "mcp:create-worktree",
+      });
 
       return {
         content: [],
@@ -1865,7 +1967,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       },
     },
     async ({ cwd, worktreePath, worktreeSlug }) => {
-      const repoRoot = resolveScopedCwd(cwd, { required: true });
+      const resolvedCwd = resolveScopedCwd(cwd, { required: true });
       if (!worktreePath && !worktreeSlug) {
         throw new Error("worktreePath or worktreeSlug is required");
       }
@@ -1890,6 +1992,7 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
       if (!options.emitSessionMessage) {
         throw new Error("Session message emitter is required to archive worktrees");
       }
+      const repoRoot = await options.workspaceGitService.resolveRepoRoot(resolvedCwd);
 
       const targetPath =
         worktreePath ??
@@ -1926,6 +2029,10 @@ export async function createAgentMcpServer(options: AgentMcpServerOptions): Prom
           requestId: "mcp:archive_worktree",
         },
       );
+      await options.workspaceGitService.listWorktrees(repoRoot, {
+        force: true,
+        reason: "mcp:archive-worktree",
+      });
 
       return {
         content: [],
