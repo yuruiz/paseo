@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   applyWindowControlsOverlayUpdate,
+  createDarwinWakeSurfaceRefreshScheduler,
   createWindowControlsOverlayState,
   getMainWindowChromeOptions,
   getTitleBarOverlayOptions,
@@ -9,6 +10,7 @@ import {
   readWindowControlsOverlayUpdate,
   readWindowTheme,
   resolveRuntimeTitleBarOverlayOptions,
+  type RefreshableBrowserWindow,
 } from "./window-manager";
 
 describe("window-manager", () => {
@@ -133,6 +135,82 @@ describe("window-manager", () => {
         symbolColor: "#e4e4e7",
         height: 47,
       });
+    });
+  });
+
+  describe("createDarwinWakeSurfaceRefreshScheduler", () => {
+    function createRefreshableWindow(): RefreshableBrowserWindow {
+      return {
+        isDestroyed: vi.fn(() => false),
+        webContents: {
+          invalidate: vi.fn(),
+        },
+        isMaximized: vi.fn(() => false),
+        isFullScreen: vi.fn(() => false),
+        getSize: vi.fn(() => [1200, 800]),
+        setSize: vi.fn(),
+      };
+    }
+
+    function createTimerHarness() {
+      const callbacks: Array<() => void> = [];
+      const setTimer = vi.fn((callback: () => void, _delayMs?: number) => {
+        callbacks.push(callback);
+        return { id: callbacks.length } as ReturnType<typeof setTimeout>;
+      }) as unknown as typeof setTimeout;
+      const clearTimer = vi.fn() as unknown as typeof clearTimeout;
+      return { callbacks, setTimer, clearTimer };
+    }
+
+    it("coalesces repeated wake events while a refresh pass is pending", () => {
+      const win = createRefreshableWindow();
+      const refreshSurface = vi.fn();
+      const log = vi.fn();
+      const timers = createTimerHarness();
+      const scheduler = createDarwinWakeSurfaceRefreshScheduler({
+        win,
+        delaysMs: [0, 100],
+        refreshSurface,
+        setTimer: timers.setTimer,
+        clearTimer: timers.clearTimer,
+        log,
+      });
+
+      scheduler.schedule("unlock-screen");
+      scheduler.schedule("resume");
+
+      expect(log).toHaveBeenCalledOnce();
+      expect(log).toHaveBeenCalledWith("unlock-screen");
+      expect(timers.setTimer).toHaveBeenCalledTimes(2);
+      expect(timers.setTimer).toHaveBeenNthCalledWith(1, expect.any(Function), 0);
+      expect(timers.setTimer).toHaveBeenNthCalledWith(2, expect.any(Function), 100);
+
+      timers.callbacks[0]?.();
+      timers.callbacks[1]?.();
+
+      expect(refreshSurface).toHaveBeenCalledTimes(2);
+      expect(refreshSurface).toHaveBeenCalledWith(win);
+
+      scheduler.schedule("user-did-become-active");
+
+      expect(log).toHaveBeenCalledTimes(2);
+      expect(timers.setTimer).toHaveBeenCalledTimes(4);
+    });
+
+    it("cancels pending wake refresh timers", () => {
+      const win = createRefreshableWindow();
+      const timers = createTimerHarness();
+      const scheduler = createDarwinWakeSurfaceRefreshScheduler({
+        win,
+        delaysMs: [0, 100, 500],
+        setTimer: timers.setTimer,
+        clearTimer: timers.clearTimer,
+      });
+
+      scheduler.schedule("unlock-screen");
+      scheduler.cancel();
+
+      expect(timers.clearTimer).toHaveBeenCalledTimes(3);
     });
   });
 

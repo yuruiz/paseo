@@ -60,6 +60,14 @@ npm run db:query -- --db /path/to/db "SELECT ..."
 Auto-detects the running dev daemon's database from `/tmp/paseo-dev.*`, `PASEO_HOME`, or `~/.paseo/db`.
 Pass either a DB directory or a `paseo.sqlite` file to `--db`. The script opens the database directly in read-only mode.
 
+### Desktop macOS wake/unlock
+
+The desktop app has a macOS-specific Chromium surface refresh in
+`packages/desktop/src/window/window-manager.ts`. Locking and unlocking the screen can leave
+Electron's compositor visually stale even when the main process and daemon are still healthy, so
+`setupDarwinPaintRefresh()` listens for Electron `powerMonitor` wake/session events and nudges the
+window surface. Treat this as desktop UI recovery; do not restart the main daemon to diagnose it.
+
 ## paseo.json service scripts
 
 `worktree.setup` and `worktree.teardown` accept either a multiline shell script or an array

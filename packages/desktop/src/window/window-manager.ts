@@ -1,4 +1,12 @@
-import { app, BrowserWindow, Menu, ipcMain, nativeTheme } from "electron";
+import {
+  app,
+  BrowserWindow,
+  Menu,
+  type WebContents,
+  ipcMain,
+  nativeTheme,
+  powerMonitor,
+} from "electron";
 
 export function readBadgeCount(input: unknown): number {
   if (typeof input !== "number" || !Number.isSafeInteger(input) || input < 0) {
@@ -20,6 +28,17 @@ export interface WindowControlsOverlayState {
   backgroundColor?: string;
   foregroundColor?: string;
 }
+
+export interface RefreshableBrowserWindow {
+  isDestroyed(): boolean;
+  webContents: Pick<WebContents, "invalidate">;
+  isMaximized(): boolean;
+  isFullScreen(): boolean;
+  getSize(): readonly number[];
+  setSize(width: number, height: number): void;
+}
+
+const DARWIN_WAKE_SURFACE_REFRESH_DELAYS_MS = [0, 100, 500, 1500] as const;
 
 export function readWindowTheme(input: unknown): WindowTheme | null {
   if (input === "light" || input === "dark") {
@@ -219,7 +238,7 @@ export function setupWindowResizeEvents(win: BrowserWindow): void {
   });
 }
 
-function refreshChromiumSurface(win: BrowserWindow): void {
+export function refreshChromiumSurface(win: RefreshableBrowserWindow): void {
   if (win.isDestroyed()) {
     return;
   }
@@ -230,12 +249,71 @@ function refreshChromiumSurface(win: BrowserWindow): void {
   }
 
   const [width, height] = win.getSize();
+  if (typeof width !== "number" || typeof height !== "number") {
+    return;
+  }
   win.setSize(width + 1, height);
   setTimeout(() => {
     if (!win.isDestroyed()) {
       win.setSize(width, height);
     }
   }, 32);
+}
+
+export function createDarwinWakeSurfaceRefreshScheduler(input: {
+  win: RefreshableBrowserWindow;
+  delaysMs?: readonly number[];
+  refreshSurface?: (win: RefreshableBrowserWindow) => void;
+  setTimer?: typeof setTimeout;
+  clearTimer?: typeof clearTimeout;
+  log?: (reason: string) => void;
+}): { schedule: (reason: string) => void; cancel: () => void } {
+  const delaysMs = input.delaysMs ?? DARWIN_WAKE_SURFACE_REFRESH_DELAYS_MS;
+  const refreshSurface = input.refreshSurface ?? refreshChromiumSurface;
+  const setTimer = input.setTimer ?? setTimeout;
+  const clearTimer = input.clearTimer ?? clearTimeout;
+  const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+
+  const cancel = () => {
+    for (const timer of pendingTimers) {
+      clearTimer(timer);
+    }
+    pendingTimers.clear();
+  };
+
+  const schedule = (reason: string) => {
+    if (input.win.isDestroyed() || pendingTimers.size > 0) {
+      return;
+    }
+
+    input.log?.(reason);
+    for (const delayMs of delaysMs) {
+      let timer: ReturnType<typeof setTimeout>;
+      timer = setTimer(() => {
+        pendingTimers.delete(timer);
+        if (!input.win.isDestroyed()) {
+          refreshSurface(input.win);
+        }
+      }, delayMs);
+      pendingTimers.add(timer);
+    }
+  };
+
+  return { schedule, cancel };
+}
+
+function describeWindowSurfaceState(win: BrowserWindow): Record<string, unknown> {
+  return {
+    isVisible: win.isVisible(),
+    isFocused: win.isFocused(),
+    isMinimized: win.isMinimized(),
+    isMaximized: win.isMaximized(),
+    isFullScreen: win.isFullScreen(),
+    bounds: win.getBounds(),
+    webContentsId: win.webContents.id,
+    isLoadingMainFrame: win.webContents.isLoadingMainFrame(),
+    url: win.webContents.getURL(),
+  };
 }
 
 export function setupDarwinPaintRefresh(win: BrowserWindow): void {
@@ -249,6 +327,33 @@ export function setupDarwinPaintRefresh(win: BrowserWindow): void {
     if (!win.isDestroyed()) {
       win.webContents.invalidate();
     }
+  };
+  const wakeRefreshScheduler = createDarwinWakeSurfaceRefreshScheduler({
+    win,
+    log: (reason) => {
+      console.info("[window] Refreshing Chromium surface after macOS wake event", {
+        reason,
+        ...describeWindowSurfaceState(win),
+      });
+    },
+  });
+  const handlePowerResume = () => wakeRefreshScheduler.schedule("resume");
+  const handleUnlockScreen = () => wakeRefreshScheduler.schedule("unlock-screen");
+  const handleUserDidBecomeActive = () => wakeRefreshScheduler.schedule("user-did-become-active");
+  const handleRendererUnresponsive = () => {
+    console.warn("[window] Renderer became unresponsive", describeWindowSurfaceState(win));
+  };
+  const handleRendererResponsive = () => {
+    console.info("[window] Renderer became responsive", describeWindowSurfaceState(win));
+  };
+  const handleRenderProcessGone = (
+    _event: Electron.Event,
+    details: Electron.RenderProcessGoneDetails,
+  ) => {
+    console.warn("[window] Renderer process gone", {
+      details,
+      ...describeWindowSurfaceState(win),
+    });
   };
   const handleChildProcessGone = (
     _event: Electron.Event,
@@ -264,10 +369,23 @@ export function setupDarwinPaintRefresh(win: BrowserWindow): void {
 
   win.on("restore", requestSurfaceRefresh);
   win.on("show", requestSurfaceRefresh);
+  powerMonitor.on("resume", handlePowerResume);
+  powerMonitor.on("unlock-screen", handleUnlockScreen);
+  powerMonitor.on("user-did-become-active", handleUserDidBecomeActive);
+  win.webContents.on("unresponsive", handleRendererUnresponsive);
+  win.webContents.on("responsive", handleRendererResponsive);
+  win.webContents.on("render-process-gone", handleRenderProcessGone);
   app.on("child-process-gone", handleChildProcessGone);
   win.once("closed", () => {
+    wakeRefreshScheduler.cancel();
     win.off("restore", requestSurfaceRefresh);
     win.off("show", requestSurfaceRefresh);
+    powerMonitor.off("resume", handlePowerResume);
+    powerMonitor.off("unlock-screen", handleUnlockScreen);
+    powerMonitor.off("user-did-become-active", handleUserDidBecomeActive);
+    win.webContents.off("unresponsive", handleRendererUnresponsive);
+    win.webContents.off("responsive", handleRendererResponsive);
+    win.webContents.off("render-process-gone", handleRenderProcessGone);
     app.off("child-process-gone", handleChildProcessGone);
   });
 }
